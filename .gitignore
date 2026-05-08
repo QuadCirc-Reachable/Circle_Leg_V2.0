@@ -1,0 +1,73 @@
+# Compiled Object files
+*.slo
+*.lo
+*.o
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.elf
+*.bin
+*.hex
+*.lst
+*.rd
+*.map
+
+# Track the DSP Static library 
+!Middlewares/ST/ARM/DSP/Lib/*.a
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+*.user
+*.jdebug.user
+*.jdebug
+
+# Dependency files
+*.d
+
+# Text editor configuration
+.idea/
+.cache/
+.vscode/
+.settings/
+.history/
+*.sublime-workspace
+
+# Patch cache
+*.orig
+
+# Build directory
+build/
+compile_commands.json
+.ccls-cache
+.vagrant
+
+# cubeMX files
+.mxproject
+.project
+
+# Folder view configuration files
+.DS_Store
+Desktop.ini
+
+# Thumbnail cache files
+._*
+Thumbs.db
+
+# Files that might appear on external disks
+.Spotlight-V100
+.Trashes
+
+# Application specific files
+venv
+node_modules
+.sass-cache
+

@@ -1,0 +1,3 @@
+[submodule "RM2025-Core"]
+	path = RM2025-Core
+	url = https://github.com/QuadCirc-Reachable/RM2025-Core.git

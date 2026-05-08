@@ -1,0 +1,692 @@
+================================================================================
+                    APPLICATION CODE STRUCTURE SUMMARY
+================================================================================
+
+//==============================================================================
+// 1. FILE OVERVIEW
+//==============================================================================
+
+  Cust_Types.hpp      — Enums (Chassis_State), common structs (MIT_Params, Wheel_Leg_Params)
+  Comm_Msg.hpp        — Protocol messages: PC_Msg (13B input), Reachable_Msg (40B output)
+  Robot_Params.hpp    — Mechanical constants (wheel radius, offset, track width, mass, etc.)
+  Helper.hpp          — Utility: angle wrap, clamp, deg/rad conversion
+
+  Robot_Config.hpp/cpp — Motor instantiation, Wheel_Leg pairing, PID config
+  Chassis.hpp/cpp      — Main control orchestrator, state machine, inverse kinematics
+  Chassis_Task.hpp/cpp — FreeRTOS task entry: 500Hz control loop
+  Wheel_Leg.hpp/cpp    — Single wheel-leg unit: pipeline control, compensation, VMC
+  Impedance_Controller.hpp/cpp — Variable impedance suspension: Kp/Kd/FFW modulation
+  Ground_Contact.hpp/cpp — Warp PI compensator: diagonal load balancing via ΔH
+  Climbing_Dynamics.hpp/cpp — Step-climbing kinematics: per-leg state machine
+  Controller.hpp/cpp   — Joystick -> velocity mapping (Vx, Wz)
+  PC_Comm.hpp/cpp      — UART serial comm with PC/ROS, timeout detection
+
+  Core/Src/UserTask.cpp — FreeRTOS task creation entry point
+
+
+//==============================================================================
+// 2. ENUMERATIONS & KEY DATA TYPES
+//==============================================================================
+
+  Chassis_State (Cust_Types.hpp):
+    CALIBRATION     — HT8115 zero position calibration
+    IDLE            — Legs hold current position (Kp=35, Kd=1.5, FFW=0)
+    ENERGY_SAVING   — Legs extended (0°), wheels respond to joystick
+    COMFORT         — Variable impedance suspension + body leveling
+    CLIMBING        — Per-leg step-climbing kinematics + warp compensation
+    FREE_CONTROL    — Trigger directly controls leg angle (0°~180°)
+    DEBUG           — Debug output mode
+    ERROR           — Error state
+
+  MIT_Params:
+    Position (rad), Velocity (rad/s), Pos_KP, Vel_KD, FFW_Current (A)
+
+  Wheel_Leg_Params:
+    Wheel_RPM, Leg_POS (deg), Leg_Force (N-m), Leg_RPM (rad/s),
+    Leg_Kp, Leg_Kd, state
+
+  Protocol::PC_Msg (13 bytes):
+    Left/Right joystick (angle, radius), triggers, button status
+
+  Protocol::Reachable_Msg (40 bytes):
+    Motor positions, RPMs, temperatures (feedback to PC)
+
+
+//==============================================================================
+// 3. CLASS HIERARCHY & RELATIONSHIPS
+//==============================================================================
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │ PROTOCOL (Communication Messages)                           │
+  │ ├─ PC_Msg          (13 bytes input)                         │
+  │ ├─ Reachable_Msg   (40 bytes output)                        │
+  │ └─ Joystick_Info, MIT_Params                                │
+  └──────────────────────┬──────────────────────────────────────┘
+                         │
+          ┌──────────────┴──────────────┐
+          │                             │
+          ▼                             ▼
+  ┌──────────────────┐        ┌──────────────────────────────────┐
+  │   PC_Comm        │        │  Chassis (Main Controller)       │
+  │  (UART Adapter)  │        │                                  │
+  │                  │        │  Contains:                       │
+  │ ├─receive        │        │  ├─ Wheel_Leg ×4 (FL/FR/BL/BR)  │
+  │ ├─transmit       │        │  ├─ Controller ×1                │
+  │ └─timeout check  │        │  ├─ Impedance_Controller ×1     │
+  └──────────────────┘        │  ├─ GroundContact ×1             │
+                              │  ├─ Climbing_Dynamics ×1         │
+                              │  └─ Chassis_State machine        │
+                              └────────────┬─────────────────────┘
+                                           │
+               ┌───────────┬───────┬───────┴──────┬──────────────┐
+               │           │       │              │              │
+               ▼           ▼       ▼              ▼              ▼
+      ┌──────────────┐ ┌────────┐ ┌────────────┐ ┌────────────┐ ┌───────────────┐
+      │  Wheel_Leg   │ │Control-│ │ Impedance  │ │  Ground    │ │   Climbing    │
+      │ (1 unit)     │ │  ler   │ │ Controller │ │  Contact   │ │   Dynamics    │
+      │              │ │        │ │            │ │            │ │               │
+      │ ├─Wheel Pipe │ │Map_Joy │ │ ├─update() │ │ ├─update() │ │ ├─update()    │
+      │ ├─Leg Pipe   │ └────────┘ │ ├─Kp/Kd   │ │ └─getDeltaH│ │ ├─startClimb │
+      │ ├─Wheel_Comp │            │ ├─FFW      │ └────────────┘ │ └─per-leg FSM │
+      │ └─VMC_Calc   │            │ └─Warp mod │                └───────────────┘
+      │              │            └────────────┘
+      │  Contains:   │
+      │ ├─M3508  ×1  │
+      │ ├─HT8115 ×1  │
+      │ ├─PID    ×2  │
+      │ └─Info struct│
+      └──────────────┘
+
+
+//==============================================================================
+// 4. CONTROL FLOW DIAGRAM
+//==============================================================================
+
+  COMFORT MODE (500 Hz):
+  ┌────────────────────────────────────────────────────────────────────┐
+  │ handleComfortMode(cmd)                                            │
+  │  1. readAndTransformIMU()  — pitch, roll, accel_z, rates          │
+  │  2. handleHeightButtons()  — button → height + bending direction  │
+  │  3. Gather leg_currents[4], leg_angles[4] from Wheel_Legs        │
+  │  4. impedance_.update(currents, angles, accel, rates, dt)         │
+  │     ├─ Mass estimation: LPF(Σ|I|) × KA×GR / g                   │
+  │     ├─ Warp error: mean(I_FL,I_BR) − mean(I_FR,I_BL)            │
+  │     ├─ Per-leg Kp: r²sin²θ × kv_base × (1 − γ·warp_modulation) │
+  │     ├─ Per-leg Kd: r²sin²θ × cv_base                            │
+  │     └─ Per-leg FFW: −load·g·r·sinθ − warp_sign·warp·gain        │
+  │  5. executeBodyControlImpedance(cmd)                              │
+  │     ├─ PID: pitch/roll → per-leg height offset (±h_adj)          │
+  │     ├─ h_i = target_height ± pitch_adj ± roll_adj                │
+  │     ├─ Set_Leg_Height(h_i, v_i, kp_i, kd_i, ffw_i)             │
+  │     └─ Inverse kinematics → wheel RPM → Execute                  │
+  └────────────────────────────────────────────────────────────────────┘
+
+  CLIMBING MODE (500 Hz):
+  ┌────────────────────────────────────────────────────────────────────┐
+  │ handleClimbingMode(cmd)                                           │
+  │  1. readAndTransformIMU()                                         │
+  │  2. handleHeightButtons()                                         │
+  │  3. climbing_.update(feedback[4], dt) — per-leg FSM               │
+  │  4. ground_contact_.update(currents[4], dt) — warp PI → ΔH       │
+  │  5. PID leveling + climbing ΔH + warp ΔH → per-leg height        │
+  │  6. Set_Leg_Height(h, v) → Execute                                │
+  └────────────────────────────────────────────────────────────────────┘
+
+
+//==============================================================================
+// 5. DETAILED CLASS SPECIFICATIONS
+//==============================================================================
+
+  --- A. Chassis (Chassis.hpp / Chassis.cpp) ---
+
+    Purpose: Main control orchestrator, state machine, body-level control
+
+    Members:
+      Chassis_State current_state_
+      Controller controller_
+      Wheel_Leg *FL/FR/BL/BR_WheelLegs_
+      Impedance_Controller impedance_
+      GroundContact ground_contact_
+      Climbing_Dynamics climbing_
+      float target_chassis_height_
+      // IMU state (updated per cycle):
+      float chassis_pitch_, chassis_roll_, chassis_accel_z_
+      float chassis_pitch_rate_, chassis_roll_rate_
+      // Mode transition:
+      float exit_kp_[4], exit_kd_[4]
+      uint16_t mode_transition_timer_ (TRANSITION_FRAMES = 200)
+
+    Debug Structs:
+      DbgIMU         — pitch, roll, accel_z
+      DbgLeveling    — h_fl, h_fr, h_bl, h_br
+      DbgClimbing    — dh per leg + phase
+      DbgControl     — state_cmd, step_height_mm
+      DbgGroundContact — warp_error, warp_dh, dh per leg
+      DbgImpedance   — kp/kd/ffw per leg, mass_est, warp_error, vz
+
+    Body Leveling PID (Comfort Mode):
+      Roll PID:   Kp=0.015, Ki=0.0002,  Kd=0.00012, limit=0.08m
+      Pitch PID:  Kp=0.015, Ki=0.00015, Kd=0.00012, limit=0.08m
+      Output: per-leg height offset in meters
+
+    Bending Direction:
+      BEND_STD = {+1, +1, +1, +1}  — all legs outward (positive θ)
+      BEND_INV = {-1, -1, -1, -1}  — all legs inward (negative θ)
+      Buttons: X/Y/A/B → STD,  LB/RB → INV
+
+    Methods:
+      Update(PC_Msg)                — Main entry, dispatches to mode handlers
+      Init()                        — Enable all motors
+      Get_Msg()                     — Collect motor feedback into Reachable_Msg
+      Set_Mode(state)               — Switch state, capture exit Kp/Kd, reset controllers
+      handleCalibrationMode()       — Zero HT8115 motors
+      handleIdleMode()              — Hold position: Kp=35, Kd=1.5, FFW=0
+      handleComfortMode(msg)        — Impedance suspension + PID leveling
+      handleClimbingMode(msg)       — Per-leg climbing kinematics + warp ΔH
+      handleEnergySaving(msg)       — Legs at 0°, smooth Kp ramp from exit values
+      handleFreeControl(msg)        — Trigger controls leg angle 0°~180°
+      readAndTransformIMU()         — Read IMU, rotate to chassis frame
+      handleHeightButtons(cmd)      — Button → target height + bending direction
+      executeBodyControl(cmd, dh)   — Position-based leveling (CLIMBING mode)
+      executeBodyControlImpedance(cmd) — Impedance leveling (COMFORT mode)
+      inverseKinematics(vx, vy, wz, out[4])
+        FL/BL = Vx - Wz·W/2
+        FR/BR = Vx + Wz·W/2
+
+
+  --- B. Impedance_Controller (Impedance_Controller.hpp / .cpp) ---
+
+    Purpose: Variable impedance active suspension via MIT Kp/Kd/FFW modulation
+
+    Derivation:
+      Cartesian virtual spring/damper → Joint-space MIT parameters via Jacobian
+      H = R + r·cos(θ)  →  Kp_MIT = r²·sin²(θ) × Kv (virtual stiffness)
+                             Kd_MIT = r²·sin²(θ) × Cv (virtual damping)
+
+    Algorithm (500 Hz, in update()):
+      1) Mass Estimation:
+         I_filter = LPF(Σ|I_i|, α=0.01)
+         M_est = I_filter × KA×GR / g,  M_est ≥ 1.0 kg
+
+      2) Body Vertical Velocity (for Skyhook — currently disabled):
+         Leaky integrator + HPF on accel_z
+         Per-leg velocity via rigid-body kinematics
+
+      3) Warp Error (diagonal load imbalance):
+         e_warp = mean(I_FL, I_BR) − mean(I_FR, I_BL)
+         Deadband ±0.02A, clamped to ±3.0A
+
+      4) Per-Leg Impedance (the core):
+         Kp modulation: kv_i = kv_base × (1 − γ × warp_sign[i] × warp_norm)
+           Overloaded diagonal → softer (retracts on obstacle)
+           Underloaded diagonal → stiffer (holds height)
+         Kd: cv_i = cv_base (fixed, skyhook disabled)
+         Kp_MIT = clamp(r²sin²θ × kv_i, 2, 100)
+         Kd_MIT = clamp(r²sin²θ × cv_i, 0.3, 4.5)
+         Ramp blend: output = entry_Kp + α × (raw − entry_Kp), α: 0→1
+
+      5) FFW Torque:
+         Gravity comp: τ_grav = −load_per_leg × g × r × sin(θ)
+         Warp offset:  τ_warp = −warp_sign[i] × warp_clamped × warp_ffw_gain
+           → Pushes underloaded legs toward ground
+           → Lightens overloaded legs (retracts from obstacle)
+         Total: τ_ff = τ_grav + τ_warp
+
+    Warp Sign Pattern:
+      {FL:+1, FR:−1, BL:−1, BR:+1}
+      Kp: +warp_sign → overloaded softens
+      FFW: −warp_sign → underloaded pushes down (opposite direction!)
+
+    Config Defaults:
+      kv_base        = 800 N/m    (→ Kp ≈ 3.4 @ θ=90°)
+      cv_base        = 250 N·s/m  (→ Kd ≈ 1.06)
+      kv_warp_gain   = 0.5        (50% Kp redistribution)
+      kv_min         = 100 N/m    (floor)
+      warp_deadband  = 0.02 A
+      warp_clamp     = 3.0 A
+      warp_ffw_gain  = 0.25 Nm/A
+      entry_kp       = 35         (transition start)
+      entry_kd       = 1.5
+      ramp_rate      = 0.005      (200 cycles to full)
+      ka_times_gr    = 3.5        (KA=0.583 × GR=6)
+      ffw_lpf_alpha  = 0.01       (mass estimation filter)
+      leg_mass       = 0.5 kg
+
+    Output Interface:
+      getLegOutput(i) → { kp, kd, ffw_torque }
+      getEstimatedMass(), getBodyVelZ(), getWarpError()
+
+
+  --- C. Wheel_Leg (Wheel_Leg.hpp / Wheel_Leg.cpp) ---
+
+    Purpose: One wheel-leg unit with 3-stage pipeline control
+
+    Members:
+      Motors::M3508 *wheel_motor
+      Motors::HT8115 *leg_motor
+      PID *Wheel_Vel_PIDs, *Leg_Vel_PIDs, *Leg_Pos_PIDs
+      Wheel_Leg_Params info
+      float leg_offset  (calibration)
+      int bending_direction_ = 1  (+1 outward, -1 inward)
+
+    Wheel Pipeline (3-stage):
+      Set_Wheel_Target(rpm)
+        → Add_Wheel_Compensation(rpm)
+        → Execute_Wheel_Control()
+        → Velocity PID → M3508 Command
+      Zero-speed deadband: ±3 RPM
+
+    Leg Pipeline (3-stage):
+      Set_Leg_Target(pos, vel, force)
+        → Add_Leg_Compensation(...)
+        → Execute_Leg_Control()
+        → Slew rate limiter + multi-turn unwrap
+        → HT8115 MIT Mode: {θ, ω, Kp, Kd, FFW_current}
+
+    Set_Leg_Height(h, v):
+      h = R + r·cos(θ)  →  θ = arccos((h − R) / r)
+      Apply bending_direction_: target_angle = θ × bending_direction_
+      Singularity clamp near 0° and 180° (±10°)
+
+    Set_Leg_Height(h, v, kp, kd, ffw_torque):  [Impedance overload]
+      Same θ calculation, but overrides MIT Kp/Kd/FFW
+      FFW current = ffw_torque / KA  (KA = 0.583)
+
+    Key Algorithms:
+      Wheel_Compensation():
+        n_wheel = n_leg × (1 + (r/R) × cos(θ))
+
+      VMC_Calculation(F_z):
+        τ = F_z × r × cos(θ)
+
+
+  --- D. GroundContact (Ground_Contact.hpp / Ground_Contact.cpp) ---
+
+    Purpose: Warp (diagonal twist) compensator via PI control on ΔH
+
+    Algorithm:
+      e_warp = mean(I_FL, I_BR) − mean(I_FR, I_BL)
+      Apply deadband (±0.15A), then PI control:
+        warp_dh += ki × e_warp × dt
+        total = kp × e_warp + warp_dh
+        Clamp to ±max_warp_dh
+
+    Per-leg ΔH pattern:
+      FL: −dh,  FR: +dh,  BL: +dh,  BR: −dh
+
+    Config:
+      kp = 0.002 m/A,  ki = 0.0005 m/(A·s)
+      max_warp_dh = 0.020 m
+      deadband = 0.15 A
+
+    Used by: CLIMBING mode (COMFORT uses Impedance_Controller's internal warp)
+
+
+  --- E. Climbing_Dynamics (Climbing_Dynamics.hpp / Climbing_Dynamics.cpp) ---
+
+    Purpose: Per-leg step-climbing kinematics with constant chassis height
+
+    Enums:
+      LegClimbPhase: IDLE → PREP → DETECT → CLIMBING → COMPLETE
+
+    Per-Leg State Machine:
+      PREP:     Set θ to prep angle, wait until reached
+      DETECT:   Monitor wheel_current > threshold, confirm duration
+      CLIMBING: Integrate β from wheel angular velocity
+                θ̇ = √(R² − [R−h+L(1−cosθ)]²) / (L·sinθ) × φ_w
+                Output: target_h = R + L·cosθ
+      COMPLETE: Reset to IDLE
+
+    Config:
+      prep_theta_deg = 15°, wheel_current_threshold = 3.0 A
+      detect_confirm_s = 0.050 s, theta_min_deg = 3°
+
+
+  --- F. Controller (Controller.hpp / Controller.cpp) ---
+
+    Purpose: Map joystick input to velocity commands
+
+    Method: Map_Joystick_To_Velocity(PC_Msg, &vx, &wz)
+      Left stick  → Forward/backward velocity  (angle 30°-150° / 210°-330°)
+      Right stick → Rotation velocity           (angle 100°-260° / others)
+      Deadzone: 200 LSB
+      Scales to MAX_FORWARD_RPM / MAX_TURN_RPM
+
+
+  --- G. PC_Comm (PC_Comm.hpp / PC_Comm.cpp) ---
+
+    Purpose: UART serial communication with PC/ROS
+
+    Methods:
+      PC_RxCallback()       — ISR for received messages
+      Fetch_PC_Msg()        — Thread-safe read of latest command
+      Update_Reachable_Msg()— Send feedback to PC
+      Is_Connected()        — 500 ms timeout detection
+
+
+//==============================================================================
+// 6. MODE TRANSITION DIAGRAM
+//==============================================================================
+
+                    ┌─────────────┐
+                    │ CALIBRATION │ (power-on)
+                    └──────┬──────┘
+                           ▼
+                    ┌─────────────┐
+                    │    IDLE     │← disconnect timeout
+                    └──┬───┬──┬──┘
+                       │   │  │
+        ┌──────────────┘   │  └──────────────┐
+        ▼                  ▼                  ▼
+  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+  │ENERGY_SAVING │  │   COMFORT    │  │   CLIMBING   │
+  │ Kp=20, ext.  │  │  Impedance   │  │  Step climb  │
+  └──────────────┘  │  Kp/Kd/FFW   │  │  + warp ΔH   │
+                    │  modulation   │  └──────────────┘
+                    └──────────────┘
+
+  Transitions:
+    COMFORT → ENERGY_SAVING: smooth Kp ramp (200 frames)
+    COMFORT → IDLE: captures exit Kp/Kd for ramp
+    Any → IDLE: on disconnect (holds position)
+      PC_CommTask()         — FreeRTOS periodic task (100ms tx rate)
+
+
+//==============================================================================
+// 5. MOTOR HARDWARE LAYOUT
+//==============================================================================
+
+  Motor Layout (top view):
+
+         FL(ID2) -------- FR(ID3)
+           |                |
+           |                |
+         BL(ID1) -------- BR(ID4)
+
+  WHEEL MOTORS:  M3508  (IDs 1-4 on CAN2)
+  LEG MOTORS:    HT8115 (IDs 1-4 on CAN3) or GM6020 (IDs 1-4 on CAN1)
+
+  Wheel-Leg Pairing:
+    FL: M3508(2) + HT8115(2) / GM6020(3)
+    FR: M3508(3) + HT8115(3) / GM6020(1)
+    BL: M3508(1) + HT8115(1) / GM6020(2)
+    BR: M3508(4) + HT8115(4) / GM6020(4)
+
+
+//==============================================================================
+// 6. MECHANICAL PARAMETERS (Robot_Params.hpp)
+//==============================================================================
+
+  ECCENTRIC_OFFSET_r  = 65 mm     // Leg drive radius
+  WHEEL_RADIUS_R      = 320 mm    // Wheel radius
+  WHEEL_TRACK_FRONT   = 531 mm    // FL-FR distance
+  WHEEL_TRACK_BACK    = 395 mm    // BL-BR distance
+  WHEEL_BASE          = 270 mm    // Front-back axle distance
+  ROBOT_MASS          = 10 kg
+  LEG_MASS            = 0.5 kg per leg
+
+
+//==============================================================================
+// 7. PID PARAMETERS
+//==============================================================================
+
+  Wheel Velocity PID:   Kp=200,  Ki=180,  Kd=1
+  Leg Position PID:     Kp=2500, Ki=0,    Kd=120   (GM6020)
+  Leg MIT Mode:         Kp=35,   Kd=1.5             (HT8115)
+  Body Roll Leveling:   Kp=0.004, Ki=0.00015, Kd=0.00001
+  Body Pitch Leveling:  Kp=0.004, Ki=0.0001,  Kd=0.00001
+
+
+//==============================================================================
+// 8. FREERTOS TASK STRUCTURE
+//==============================================================================
+
+  startUserTasks() [UserTask.cpp]
+  ├─ blink             — LED/Laser toggle (500ms)          [Priority 0]
+  ├─ CANManager::init()— Init 3 CAN buses
+  ├─ HT8115::init()    — Init HT motor driver
+  ├─ DJIMotor::init()  — Init DJI motor driver
+  ├─ IMU::init()       — Init IMU sensor
+  ├─ RosComm::init()   — Init serial communication
+  ├─ Command_Task::init()                                  [Priority 0]
+  │   └─ PC_CommTask   — Receive PC_Msg, Send Reachable_Msg (100ms tx)
+  └─ Chassis_Task::init()                                  [Priority 0]
+      └─ Chassis_Task  — Main control loop (2ms = 500 Hz)
+         ├─ Wait 3s for HT motor startup
+         ├─ Chassis::Init()
+         └─ Loop:
+            ├─ Get_PC_Msg()
+            ├─ Chassis::Update()
+            ├─ DJIMotor::transmit()
+            ├─ Chassis::Get_Msg()
+            ├─ Set_Reachable_Msg()
+            └─ vTaskDelay(2)
+
+
+//==============================================================================
+// 9. STATE MACHINE & BUTTON CONTROLS
+//==============================================================================
+
+  Button Controls:
+    ML + MR (both)  → CALIBRATION
+    ML alone         → Previous state (circular)
+    MR alone         → Next state (circular)
+
+  State Cycle:
+    IDLE(1) → ENERGY_SAVING(2) → COMFORT(3) → CLIMBING(4) → FREE_CONTROL(5) → IDLE
+
+  State Summary:
+  ┌─────────────────┬───────────────┬───────────────────────┬──────────────────────┐
+  │ State           │ Wheel Control │ Leg Control           │ Special              │
+  ├─────────────────┼───────────────┼───────────────────────┼──────────────────────┤
+  │ CALIBRATION     │ OFF           │ Zero pos (HT8115)     │ Auto → IDLE          │
+  │ IDLE            │ OFF           │ OFF                   │ Safety state         │
+  │ ENERGY_SAVING   │ Joystick      │ 0° (extended)         │ Min power            │
+  │ COMFORT         │ Joystick      │ Suspension + leveling │ Full autonomy        │
+  │ CLIMBING        │ Joystick      │ Per-leg climbing FSM  │ Step kinematics      │
+  │ FREE_CONTROL    │ Joystick      │ Trigger (0°~180°)     │ Direct control       │
+  └─────────────────┴───────────────┴───────────────────────┴──────────────────────┘
+
+
+//==============================================================================
+// 10. COMFORT MODE CONTROL FLOW (FULL PIPELINE)
+//==============================================================================
+
+  INPUT: PC_Msg (Joystick, Buttons, Triggers)
+         │
+  1. CONTROLLER MAPPING
+     Joystick → (Vx, Wz)
+         │
+  2. INVERSE KINEMATICS
+     (Vx, Wz) → [FL_RPM, FR_RPM, BL_RPM, BR_RPM]
+         │
+  3. IMU SENSOR FUSION
+     Read Euler (Roll, Pitch, Yaw), Accel (X,Y,Z), Gyro (pitch_rate, roll_rate)
+     Correct IMU mounting offset (Roll = 182.91°)
+         │
+  4. ACTIVE SUSPENSION COMPUTATION
+     Leg currents + Accel_Z + Omega_Roll + Omega_Pitch
+     → Estimate mass (LPF) → Estimate damping C = 0.5√M
+     → Integrate accel → HPF body velocity
+     → Per-leg velocity (rigid body kinematics)
+     → Skyhook: ΔH_i = -ρ × V_i
+         │
+  5. BODY LEVELING (PID)
+     Roll PID  → ΔH left/right
+     Pitch PID → ΔH front/back
+         │
+  6. HEIGHT DISTRIBUTION TO EACH LEG
+     FL: h = h_base + Δh_pitch - Δh_roll + Δh_susp(FL)
+     FR: h = h_base + Δh_pitch + Δh_roll + Δh_susp(FR)
+     BL: h = h_base - Δh_pitch - Δh_roll + Δh_susp(BL)
+     BR: h = h_base - Δh_pitch + Δh_roll + Δh_susp(BR)
+         │
+  7. HEIGHT → LEG ANGLE
+     θ = arccos((h - R) / r)
+         │
+  8. WHEEL-LEG DECOUPLING
+     Compensation = n_leg × (1 + (r/R) × cos(θ))
+         │
+  9. MOTOR CONTROL PIPELINE
+     Wheel: Target RPM + Compensation → Vel PID → Motor Cmd
+     Leg:   Target Angle + Compensation → Pos PID → Vel PID → Motor Cmd (GM6020)
+                                        → Pos PID → MIT Cmd (HT8115)
+         │
+  10. CAN TRANSMISSION
+      DJIMotor::transmit(3, 0) — GM6020 legs on CAN1
+      DJIMotor::transmit(0, 1) — M3508 wheels on CAN2
+         │
+  11. FEEDBACK
+      Collect RPM, position, force, temperature per leg
+      → Package into Reachable_Msg → Send to PC via Serial
+
+
+//==============================================================================
+// 10b. CLIMBING MODE CONTROL FLOW
+//==============================================================================
+
+  On entry (Set_Mode → CLIMBING):
+    reset PIDs + climbing_.reset() + climbing_.startClimbAll()
+      → All legs transition IDLE → PREP
+         │
+  Per cycle (500 Hz):
+         │
+  1. READ IMU (shared: readAndTransformIMU)
+     → chassis_pitch_, chassis_roll_, accel_z_, rates
+         │
+  2. BUTTON → TARGET HEIGHT (shared: handleHeightButtons)
+     → target_chassis_height_ (used by non-climbing legs)
+         │
+  3. GATHER PER-LEG FEEDBACK
+     For each leg: LegClimbFeedback = {
+       leg_pos_deg   ← Get_LegPosition()
+       wheel_rpm     ← Get_WheelRPM()
+       wheel_current ← Get_WheelCurrentFeedback()   (M3508 current, A)
+     }
+         │
+  4. CLIMBING STATE MACHINE (climbing_.update)
+     Per-leg:
+       PREP:     Output h = R + L·cos(prep_θ).  Wait for leg near prep angle.
+       DETECT:   Hold prep_h. If wheel_current > 3A for 50ms → CLIMBING.
+       CLIMBING: Integrate β += φ_w·dt.
+                 θ from constraint: cosθ = (R+L-h-R·sinβ)/L
+                 θ̇ from kinematic eqn. Output h = R+L·cosθ, v = -L·sinθ·θ̇.
+       COMPLETE: β≥90° or θ≥θ_end → IDLE.
+         │
+  5. BODY LEVELING PID (same as COMFORT)
+     Roll PID → Δh_roll,  Pitch PID → Δh_pitch
+     Gyro Feedforward → v_pitch_ff, v_roll_ff
+         │
+  6. PER-LEG HEIGHT DISTRIBUTION (climbing-aware)
+     For each leg i:
+       If climbing (PREP/DETECT/CLIMBING):
+         h_i = climbing.getTargetHeight(i) + leveling
+         v_i = climbing.getTargetVelocity(i) + gyro_ff
+       If IDLE:
+         h_i = target_chassis_height_ + leveling
+         v_i = gyro_ff
+     → Clamp to [h_min, h_max]
+     → Set_Leg_Height(h_i, v_i)
+         │
+  7. WHEEL VELOCITY CONTROL (shared)
+     Joystick → IK → Wheel RPM → Compensation → Execute
+         │
+  8. EXECUTE ALL MOTORS
+     Execute_Wheel_Control() + Execute_Leg_Control() per leg
+
+
+//==============================================================================
+// 11. KEY FORMULAS
+//==============================================================================
+
+  Wheel-Leg Decoupling:
+    n_wheel = n_leg × (1 + r/R × cos(θ))
+
+  Height ↔ Angle:
+    h = R + r·cos(θ)   →   θ = arccos((h - R) / r)
+
+  VMC (Force → Torque):
+    τ = F_z × r × cos(θ)
+
+  Active Suspension (Skyhook):
+    Δh_i = -ρ × V_i,  where ρ = C/K,  C = 0.5√M
+
+  Climbing Kinematics (Step Climbing):
+    Constraint: cos(θ) = (R + L − h − R·sin(β)) / L
+    θ̇ = √(R² − [R−h+L(1−cosθ)]²) / (L·sinθ) × φ_w
+    β₀ = arcsin((R−h)/R)
+    θ_end = arccos((L−h)/L)
+    Output: target_h = R + L·cosθ,  target_v = −L·sinθ·θ̇
+
+  Inverse Kinematics (Differential):
+    FL/BL = Vx - Wz
+    FR/BR = Vx + Wz
+
+
+//==============================================================================
+// 12. DATA FLOW GRAPH (Mermaid)
+//==============================================================================
+
+  graph TD
+      User[PC / Remote] -->|PC_Msg| PC_Comm
+      PC_Comm -->|Fetch_PC_Msg| Chassis_Task
+      Chassis_Task -->|Update| Chassis
+
+      subgraph Chassis
+          Controller -->|Vx, Wz| IK[Inverse Kinematics]
+          IMU -->|Roll, Pitch, Accel| Leveling[Body Leveling PID]
+          IMU -->|Accel_Z, Gyro| Suspension[Active Suspension]
+          WheelFB[Wheel Current FB] -->|LegClimbFeedback| Climbing[Climbing Dynamics]
+          IK -->|Wheel RPMs| WL_FL & WL_FR & WL_BL & WL_BR
+          Leveling -->|ΔH| WL_FL & WL_FR & WL_BL & WL_BR
+          Suspension -->|ΔH COMFORT| WL_FL & WL_FR & WL_BL & WL_BR
+          Climbing -->|target_h, target_v CLIMBING| WL_FL & WL_FR & WL_BL & WL_BR
+      end
+
+      subgraph Wheel_Leg Pipeline
+          WL_FL -->|Set Target| Pipeline[Set → Compensate → Execute]
+          Pipeline -->|Wheel Compensation| M3508[M3508 Wheel Motor]
+          Pipeline -->|VMC / Pos PID| HT8115[HT8115 / GM6020 Leg Motor]
+      end
+
+      M3508 -->|CAN2| Hardware[CAN Bus]
+      HT8115 -->|CAN1/CAN3| Hardware
+      Hardware -->|Feedback| Chassis_Task
+      Chassis_Task -->|Reachable_Msg| PC_Comm
+      PC_Comm -->|Serial| User
+
+//===============================================
+
+
+    A = {1 ，   1，     1，     1 ；
+        Dm/2， Dm/2，-Dm/2，-Dm/2 ；
+       -Df/2,  Df/2, -Db/2, Db/2    }
+
+    b = { 
+            m(g+ a_z)   ;
+            PID_roll    ;
+            PID_Pitch   ;
+        }
+    
+    x = Torque t = { f1;
+                     f2;
+                     f3;
+                     f4}
+    
+    A_DLS = A^T(AA^T + lamda_1^2 I)^-1
+
+    x= A_DLS * b
+
+    J(theta) = {
+            rcos (theta);
+            0;
+            rsin(theta);
+    }
+    
+Torque 
+    t1 = J^T * f1
+    t2 = J^T * f2
+    t3 = J^T * f3
+    t4 = J^T * f4
+
+//===============================================
