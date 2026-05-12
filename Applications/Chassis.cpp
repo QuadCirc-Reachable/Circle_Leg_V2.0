@@ -159,6 +159,51 @@ void Chassis::Set_Mode(Chassis_State new_state)
         comfort_phase_        = ComfortPhase::HOMING;
         comfort_homing_ticks_ = 0;
     }
+    if (new_state == Chassis_State::ENERGY_SAVING)
+    {
+        // Capture per-leg motor-frame angle and prior Kp/Kd so HOMING can
+        // smoothly walk every leg back to θ=0 without releasing stiffness
+        // and without firing the Wheel_Compensation FF at homing speed.
+        Wheel_Leg *legs[4] = {FL_WheelLegs_, FR_WheelLegs_, BL_WheelLegs_, BR_WheelLegs_};
+
+        // Decide entry Kp/Kd per source state (mirrors COMFORT homing logic).
+        float prev_kp = 0.0f, prev_kd = 0.5f;
+        if (current_state_ == Chassis_State::COMFORT)
+        {
+            // exit_kp_/exit_kd_ already populated above (per-leg).
+        }
+        else if (current_state_ == Chassis_State::IDLE)
+        {
+            prev_kp = 0.0f;
+            prev_kd = 0.5f;
+        }
+        else
+        {
+            // Coming from any other mode: assume it was holding at ES values.
+            prev_kp = ENERGY_HOMING_KP_END;
+            prev_kd = ENERGY_HOMING_KD_END;
+        }
+
+        for (int i = 0; i < 4; i++)
+        {
+            energy_homing_start_angle_[i] = legs[i] ? legs[i]->Get_LegPosition() : 0.0f;
+            if (current_state_ == Chassis_State::COMFORT)
+            {
+                energy_homing_kp_start_[i] = exit_kp_[i];
+                energy_homing_kd_start_[i] = exit_kd_[i];
+            }
+            else
+            {
+                energy_homing_kp_start_[i] = prev_kp;
+                energy_homing_kd_start_[i] = prev_kd;
+            }
+        }
+        energy_phase_        = EnergyPhase::HOMING;
+        energy_homing_ticks_ = 0;
+        // HOMING runs its own Kp/Kd ramp; suppress the old global timer-based
+        // ramp inside handleEnergySaving RUN so they don't fight.
+        mode_transition_timer_ = 0;
+    }
     if (new_state == Chassis_State::CLIMBING)
     {
         climbing_.reset();
@@ -1068,31 +1113,59 @@ void Chassis::handleDebugMode(const Protocol::PC_Msg &cmd)
 
 void Chassis::handleEnergySaving(const Protocol::PC_Msg &cmd)
 {
-    // --- Smooth Kp ramp when transitioning from COMFORT ---
-    // Holding torque must resist gravity at the lowest pose AND the disturbance
-    // from wheel acceleration / forward-backward jerk. Too soft → leg sways,
-    // sway gets amplified by joystick input and the leg goes unstable.
-    float target_kp = 80.0f;  // Tuning history: 60 (wheel disturbance → leg sways) →
-                              // 150 (static pitch self-oscillation) → 100 (still oscillating)
-                              // → 80. Below the pitch-mode self-osc threshold.
-    float target_kd = 4.0f;   // Heavier damping (was 2.5→3.5) to fight the wheel-induced
-                              // sway with lower Kp. DM Kd_max = 5.0; keep small headroom.
-    float kp_use, kd_use;
-    if (mode_transition_timer_ > 0)
+    Wheel_Leg *legs[4] = {FL_WheelLegs_, FR_WheelLegs_, BL_WheelLegs_, BR_WheelLegs_};
+
+    // --------- HOMING sub-state ---------
+    // Walk every leg from its entry angle to motor-frame 0° via a smoothstep
+    // trajectory; simultaneously ramp Kp/Kd from the previous mode's hold
+    // values to the ES stiffness. CRUCIAL: wheels held at 0 RPM with NO
+    // Wheel_Compensation — the decoupling FF (∝ leg_rpm) at homing speed
+    // would otherwise drive the front and back axles in opposite directions
+    // (the "rear wheels go forward / front legs flip back / car tilts then
+    // snaps level" bug). The DM slew-rate limiter inside Execute_Leg_Control
+    // still caps any cycle-to-cycle step, so this is safe even if the
+    // entry angle is large.
+    if (energy_phase_ == EnergyPhase::HOMING)
     {
-        float alpha = 1.0f - (float)mode_transition_timer_ / (float)TRANSITION_FRAMES;
-        // Use per-leg average of exit values for simplicity
-        float avg_exit_kp = (exit_kp_[0] + exit_kp_[1] + exit_kp_[2] + exit_kp_[3]) * 0.25f;
-        float avg_exit_kd = (exit_kd_[0] + exit_kd_[1] + exit_kd_[2] + exit_kd_[3]) * 0.25f;
-        kp_use            = avg_exit_kp + alpha * (target_kp - avg_exit_kp);
-        kd_use            = avg_exit_kd + alpha * (target_kd - avg_exit_kd);
-        mode_transition_timer_--;
+        float alpha = (float)energy_homing_ticks_ / (float)ENERGY_HOMING_FRAMES;
+        if (alpha > 1.0f)
+            alpha = 1.0f;
+        // Smoothstep: zero velocity at both endpoints → no jerk at start/end.
+        float s = alpha * alpha * (3.0f - 2.0f * alpha);
+
+        for (int i = 0; i < 4; i++)
+        {
+            if (!legs[i])
+                continue;
+            // Linear (smoothstepped) angle interpolation in motor frame
+            // toward 0. Don't multiply by bending_direction — these are
+            // already raw motor-frame angles captured in Set_Mode.
+            float cmd_deg = energy_homing_start_angle_[i] * (1.0f - s);
+            float kp_use  = energy_homing_kp_start_[i] + alpha * (ENERGY_HOMING_KP_END - energy_homing_kp_start_[i]);
+            float kd_use  = energy_homing_kd_start_[i] + alpha * (ENERGY_HOMING_KD_END - energy_homing_kd_start_[i]);
+            legs[i]->Set_Leg_Target(cmd_deg, 0.0f, 0.0f, kp_use, kd_use);
+            legs[i]->Set_Wheel_Target(0.0f);
+            // INTENTIONALLY no Add_Wheel_Compensation here.
+        }
+
+        energy_homing_ticks_++;
+        if (energy_homing_ticks_ >= ENERGY_HOMING_FRAMES)
+        {
+            energy_phase_ = EnergyPhase::RUN;
+        }
+
+        executeMotorCommands();
+        return;
     }
-    else
-    {
-        kp_use = target_kp;
-        kd_use = target_kd;
-    }
+
+    // --------- RUN sub-state (normal ENERGY_SAVING) ---------
+    // Legs are at θ≈0 and stationary, so Wheel_Compensation() (proportional
+    // to leg_rpm) is ~0 and Set_Wheel_Leg's internal Add_Wheel_Compensation
+    // call is harmless. Joystick now drives the wheels normally.
+    float target_kp = ENERGY_HOMING_KP_END;
+    float target_kd = ENERGY_HOMING_KD_END;
+    float kp_use    = target_kp;
+    float kd_use    = target_kd;
 
     Wheel_Leg_Params params;
     params.state     = Chassis_State::ENERGY_SAVING;

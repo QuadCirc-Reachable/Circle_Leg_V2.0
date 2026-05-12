@@ -246,6 +246,30 @@ class Chassis
     static constexpr float COMFORT_HOMING_KP_END = 30.0f;  // Final Kp at end of homing
     static constexpr float COMFORT_HOMING_KD_END = 2.0f;
 
+    // ---- ENERGY_SAVING internal sub-state machine ----
+    // HOMING: drive each leg from whatever pose the previous mode left it in
+    //   back to motor-frame θ=0 (the folded ES stance). Uses a smoothstep
+    //   angle ramp + simultaneous Kp/Kd ramp from the previous mode's
+    //   stiffness to the ES hold values. During HOMING we DO NOT add
+    //   Wheel_Compensation: the decoupling FF is proportional to leg_rpm
+    //   and at homing speeds it would drive the wheels noticeably (front
+    //   and back axles in opposite directions) — that was the "rear wheels
+    //   creeping forward / front legs flipping back" symptom.
+    // RUN: normal ENERGY_SAVING — wheels follow joystick, legs hold θ=0.
+    enum class EnergyPhase : uint8_t
+    {
+        HOMING = 0,
+        RUN    = 1
+    };
+    EnergyPhase energy_phase_                   = EnergyPhase::RUN;
+    int energy_homing_ticks_                    = 0;
+    float energy_homing_kp_start_[4]            = {0.0f, 0.0f, 0.0f, 0.0f};
+    float energy_homing_kd_start_[4]            = {0.5f, 0.5f, 0.5f, 0.5f};
+    float energy_homing_start_angle_[4]         = {0.0f, 0.0f, 0.0f, 0.0f};
+    static constexpr int ENERGY_HOMING_FRAMES   = 400;  // 0.8s @500Hz — slow & smooth
+    static constexpr float ENERGY_HOMING_KP_END = 80.0f;
+    static constexpr float ENERGY_HOMING_KD_END = 4.0f;
+
    public:
     Chassis() = delete;
     /**
