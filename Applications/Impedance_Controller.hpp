@@ -98,30 +98,55 @@ class Impedance_Controller
         float r = ECCENTRIC_OFFSET_r / 1000.0f;  // m
 
         // --- Virtual Impedance (Cartesian space) ---
-        float kv_base = 800.0f;  // Base virtual stiffness (N/m)  → Kp≈3.4 @θ=90°
-        float cv_base = 250.0f;  // Fixed virtual damping (N·s/m) → Kd≈1.06
+        // Sized for human-payload (≈70 kg) operation. At θ=90°:
+        //   Kp_MIT = r²·sin²·kv = 0.0081·kv  →  kv=20000 ⇒ Kp≈162 N·m/rad
+        //   Kd_MIT = r²·sin²·cv = 0.0081·cv  →  cv=800   ⇒ Kd≈6.5 (clamped to mit_kd_max)
+        float kv_base = 20000.0f;  // Base virtual stiffness (N/m)
+        float cv_base = 1500.0f;   // Base virtual damping (N·s/m). At θ=90°: r²·cv = 12.15,
+                                   // hits the DM Kd ceiling (5) over most of the workspace,
+                                   // giving consistent near-critical damping at light load.
 
         // --- Skyhook Kd Modulation (DISABLED — accel_z noise too high) ---
-        float cv_sky_gain = 0.0f;    // Disabled: accel-based velocity estimate is pure noise
-        float cv_max      = 400.0f;  // Ceiling for cv
+        float cv_sky_gain = 0.0f;     // Disabled: accel-based velocity estimate is pure noise
+        float cv_max      = 1500.0f;  // Ceiling for cv
 
-        // --- Warp Kp/FFW Modulation (Ground Contact) ---
-        float kv_warp_gain  = 0.5f;    // Kp redistribution: overloaded diagonal softens, underloaded stiffens
-        float kv_min        = 100.0f;  // Floor for virtual stiffness (N/m) → Kp min≈0.4
-        float warp_deadband = 0.02f;   // Current deadband (A) — low for soft-leg regime
-        float warp_clamp    = 3.0f;    // Max warp error used for modulation (A)
-        float warp_ffw_gain = 0.25f;   // FFW offset (Nm/A): -warp_sign pushes overloaded diagonal DOWN
+        // --- Warp Kp/FFW Modulation (DISABLED — moved to Ground_Contact) ---
+        // The raw_warp formula here computes (I_FL+I_BR)/2 − (I_FR+I_BL)/2 on
+        // RAW motor currents, but front legs have bending_direction=-1 vs back
+        // legs +1, so equal ground load produces opposite-sign currents and
+        // the "diagonal" formula actually measures pitch-front-vs-back, not
+        // warp. Worse: feeding this signal back through kv_warp_gain (±50%
+        // Kp) and warp_ffw_gain (direct torque) creates a positive-feedback
+        // loop with the noisy current → "越抖越大" oscillation in COMFORT.
+        //
+        // The corrected warp control now lives in Ground_Contact.cpp (which
+        // normalizes by bending_direction in Chassis.cpp before calling).
+        // Keep these zero here.
+        float kv_warp_gain  = 0.0f;     // was 0.5
+        float kv_min        = 5000.0f;  // Floor for virtual stiffness (N/m)
+        float warp_deadband = 0.02f;
+        float warp_clamp    = 3.0f;
+        float warp_ffw_gain = 0.0f;  // was 0.25
 
         // --- FFW Load Estimation ---
-        float ffw_lpf_alpha = 0.01f;  // Faster LPF (~0.8 Hz @ 500 Hz) for quicker adaptation
-        float ka_times_gr   = 3.5f;   // KA_motor × GearRatio (HT8115: 0.583 × 6)
-        float leg_mass      = LEG_MASS_kg;
+        // NOTE: `leg_currents` passed to update() is actually DM output torque in Nm
+        // (DMMotor decodes the τ-field with tMax=200 Nm). Mass is estimated from
+        // per-leg balance |τ| = (M/4+m_leg)·g·r·|sin θ|; ka_times_gr is unused.
+        float ffw_lpf_alpha = 0.01f;          // ~0.8 Hz LPF on M_est. Slower than mechanical
+                                              // response → breaks self-feedback limit cycle.
+        float mass_update_v_thresh = 0.04f;   // m/s; only update M_est when ALL legs settled
+        float ka_times_gr          = 1.263f;  // DM J10010L_2EC: KA(0.1263 Nm/A) × GR(10) — kept for reference, unused
+        float leg_mass             = LEG_MASS_kg;
 
         // --- MIT Parameter Limits (hardware) ---
-        float mit_kp_min = 2.0f;
-        float mit_kp_max = 100.0f;
-        float mit_kd_min = 0.3f;
-        float mit_kd_max = 4.5f;
+        // DM J10010L MIT mode accepts Kp ∈ [0, 500], Kd ∈ [0, 5]; we leave headroom.
+        // Kd floor must be substantial: at small |sin θ| (near workspace limits)
+        // the impedance-computed Kd drops to nearly zero. Without a real floor,
+        // legs lose damping and rock chaotically.
+        float mit_kp_min = 50.0f;
+        float mit_kp_max = 250.0f;
+        float mit_kd_min = 2.5f;
+        float mit_kd_max = 5.0f;
 
         // --- Mode Transition Ramp ---
         float entry_kp  = 35.0f;   // Kp to blend FROM on mode entry (matches default MIT / ENGSAV)
@@ -167,15 +192,24 @@ class Impedance_Controller
     float getEstimatedMass() const { return estimated_mass_; }
     float getBodyVelZ() const { return vel_z_hp_; }
     float getWarpError() const { return warp_error_; }
+    float getRampAlpha() const { return ramp_alpha_; }
     Config &config() { return cfg_; }
+
+    // External settle flag: caller (Chassis) sets to false whenever the
+    // commanded height is slewing. Mass estimator will refuse to update while
+    // false, so transient unloading (apparent weight loss during commanded
+    // descent) cannot collapse M_est → FFW → support → deeper drop.
+    void setSettled(bool s) { external_settled_ = s; }
 
    private:
     Config cfg_;
     LegOutput outputs_[4] = {};
 
     // Mass estimation
-    float I_filter_       = 0.0f;
-    float estimated_mass_ = 1.0f;
+    float I_filter_        = 0.0f;
+    float estimated_mass_  = 1.0f;
+    bool mass_warmed_      = false;  // false until first valid sample → snap to it
+    bool external_settled_ = true;   // set false by Chassis during slew
 
     // Body velocity (skyhook)
     float raw_vel_z_ = 0.0f;

@@ -132,6 +132,35 @@ struct DbgWheel
     float err_fl = 0.0f, err_fr = 0.0f, err_bl = 0.0f, err_br = 0.0f;
 };
 
+// Aggregated summary — one struct to watch in Ozone for the most useful signals
+// across all modes (motor angles, leg heights, IMU state, mass estimate, target).
+struct DbgSummary
+{
+    // Motor angle feedback (deg, normalized to [-180, 180])
+    float angle_fl = 0.0f, angle_fr = 0.0f, angle_bl = 0.0f, angle_br = 0.0f;
+
+    // Per-leg current height (m), computed from motor angle via
+    //   H = R - r * cos(theta_motor)
+    float height_fl = 0.0f, height_fr = 0.0f, height_bl = 0.0f, height_br = 0.0f;
+    float height_avg = 0.0f;  // average of the four legs
+
+    // Target chassis height (m) — what Set_Leg_Height is being asked for
+    float target_height = 0.0f;
+
+    // IMU state (chassis frame, after mounting transform + level trim)
+    float imu_pitch      = 0.0f;  // deg, nose-up positive
+    float imu_roll       = 0.0f;  // deg, right-up positive
+    float imu_pitch_rate = 0.0f;  // deg/s (gyro)
+    float imu_roll_rate  = 0.0f;
+    float imu_accel_z    = 0.0f;  // m/s², earth frame Z-up, gravity removed
+
+    // Sprung-mass / impedance estimator
+    float mass_est = 0.0f;  // kg
+
+    // Mode (mirrors dbg_state) for one-stop visibility
+    uint8_t state = 0;
+};
+
 extern DbgIMU dbg_imu;
 extern DbgLeveling dbg_leveling;
 extern DbgClimbing dbg_climb;
@@ -141,8 +170,7 @@ extern DbgImpedance dbg_imp;
 extern DbgTorque dbg_torque;
 extern DbgLeg dbg_leg;
 extern DbgWheel dbg_wheel;
-
-// Current chassis state (mirrors Chassis::current_state_) for Ozone watch.
+extern DbgSummary dbg_summary;
 // Values: 0=CALIBRATION,1=IDLE,2=ENERGY_SAVING,3=COMFORT,4=CLIMBING,5=FREE_CONTROL,6=DEBUG,7=ERROR
 extern volatile uint8_t dbg_state;
 
@@ -168,7 +196,10 @@ class Chassis
     float h_max_;          // height upper bound
     float h_min_;          // height lower bound
 
-    float target_chassis_height_ = 0.0f;  // Nominal height in meters
+    float target_chassis_height_                 = 0.0f;     // Filtered (slew-rate-limited) height in meters — what executors consume
+    float target_height_setpoint_                = 0.0f;     // Step setpoint written by buttons / modes; slewed into target_chassis_height_
+    float height_slew_rate_                      = 0.0f;     // m/s; current slew speed (signed), used as Kd feedforward for legs
+    static constexpr float HEIGHT_SLEW_PER_CYCLE = 0.0004f;  // 0.0004 m/cycle × 500 Hz = 0.2 m/s ramp
 
     // Ground Contact Warp Compensator (COMFORT / CLIMBING modes)
     GroundContact ground_contact_;
@@ -193,6 +224,27 @@ class Chassis
     int mode_transition_timer_             = 0;
     float exit_kp_[4]                      = {35.0f, 35.0f, 35.0f, 35.0f};  // Last impedance Kp per leg
     float exit_kd_[4]                      = {1.5f, 1.5f, 1.5f, 1.5f};      // Last impedance Kd per leg
+
+    // ---- COMFORT internal sub-state machine ----
+    // HOMING: drive each leg from whatever pose ENERGY_SAVING (or any prior
+    //   mode) left it in to a safe θ ∈ [+/-]COMFORT_HOMING_THETA, away from
+    //   the kinematic singularity at θ=0,π. Smoothly hands off Kp from the
+    //   previous mode's stiffness to COMFORT_HOMING_KP_END, so legs never
+    //   get released. Wheels held at 0 RPM.
+    // RUN: normal impedance + body-leveling control.
+    enum class ComfortPhase : uint8_t
+    {
+        HOMING = 0,
+        RUN    = 1
+    };
+    ComfortPhase comfort_phase_                  = ComfortPhase::HOMING;
+    int comfort_homing_ticks_                    = 0;
+    float comfort_homing_kp_start_[4]            = {60.0f, 60.0f, 60.0f, 60.0f};
+    float comfort_homing_kd_start_[4]            = {2.5f, 2.5f, 2.5f, 2.5f};
+    static constexpr int COMFORT_HOMING_FRAMES   = 250;    // 0.5s @500Hz
+    static constexpr float COMFORT_HOMING_THETA  = 90.0f;  // deg — middle of workspace (sin²=1)
+    static constexpr float COMFORT_HOMING_KP_END = 30.0f;  // Final Kp at end of homing
+    static constexpr float COMFORT_HOMING_KD_END = 2.0f;
 
    public:
     Chassis() = delete;
@@ -273,7 +325,14 @@ class Chassis
     void executeBodyControlImpedance(const Protocol::PC_Msg &cmd);
     void executeMotorCommands();
     void updateWheelDebug();
+    // Refresh DbgSummary aggregate (angles, heights, IMU, mass, state).
+    // Cheap; safe to call every cycle including during PC disconnect.
+    void updateDbgSummary();
     float clampHeight(float h) const { return h < h_min_ ? h_min_ : (h > h_max_ ? h_max_ : h); }
+    // Slew-rate-limit target_chassis_height_ toward target_height_setpoint_.
+    // Prevents instantaneous height jumps from button presses or mode changes
+    // from producing huge MIT command angle steps × high Kp = violent slams.
+    void slewTargetHeight();
 
     // 运动学解算：将底盘整体速度(Vx, Vy, Wz)分解为4个轮子的速度
     void inverseKinematics(float vx, float vy, float wz, float *out_wheel_rpms);

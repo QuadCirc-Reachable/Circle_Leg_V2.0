@@ -47,6 +47,9 @@ void Controller::Map_Joystick_To_Velocity(const Protocol::PC_Msg &msg, float &vx
 
     // ----- Slew-rate (acceleration) limits -----
     // Both vx and wz are limited to keep wheel-acceleration bounded.
+    // Symmetric accel/decel. (Asymmetric decel was tried to mask the
+    // wheel-release shake but the real cause was leg→wheel decoupling
+    // positive-feedback in ES; fixed in Wheel_Leg.cpp.)
     // Assumes ~500Hz control loop (vTaskDelay(2)).
     constexpr float DT           = 0.002f;
     const float max_dvx_per_tick = MAX_FWD_ACCEL_RPM_PER_S * DT;

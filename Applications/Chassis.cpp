@@ -28,11 +28,17 @@ static inline float clampSym(float v, float lim) { return v > lim ? lim : (v < -
 //   +1 → positive angle θ (0..+180°)
 //   -1 → negative angle θ (0..-180°)
 //
-// Hardware-verified bending directions (May 2026 bringup, DEBUG mode):
-//   With X button (standard stance, target=90°), all four legs need -1.
-// "Inward" stance flips every leg.
-static constexpr int BEND_STD_FL = -1, BEND_STD_FR = -1, BEND_STD_BL = -1, BEND_STD_BR = -1;
-static constexpr int BEND_INV_FL = 1, BEND_INV_FR = 1, BEND_INV_BL = 1, BEND_INV_BR = 1;
+// =====================================================================
+// DM zero-point calibration switch.
+// Set to 1 ONLY when re-zeroing the DM motors:
+//   1. Set to 1, rebuild, flash.
+//   2. Physically position every leg at the desired zero pose.
+//   3. Hold ML+MR briefly to enter CALIBRATION (writes DM flash once),
+//      then immediately release and return to IDLE.
+//   4. Set back to 0, rebuild, flash again.
+// Keep at 0 in normal builds to prevent accidental flash writes.
+// =====================================================================
+#define ENABLE_DM_CALIBRATION 0
 
 // =====================================================================
 // Global debug variables — watch these directly in Ozone
@@ -46,6 +52,7 @@ DbgImpedance dbg_imp;
 DbgTorque dbg_torque;
 DbgLeg dbg_leg;
 DbgWheel dbg_wheel;
+DbgSummary dbg_summary __attribute__((used));
 volatile uint8_t dbg_state = 0;
 
 Chassis::Chassis(Wheel_Leg *fl, Wheel_Leg *fr, Wheel_Leg *bl, Wheel_Leg *br)
@@ -58,13 +65,18 @@ Chassis::Chassis(Wheel_Leg *fl, Wheel_Leg *fr, Wheel_Leg *bl, Wheel_Leg *br)
       wb_m_(WHEEL_BASE / 1000.0f),
       wt_f_m_(WHEEL_TRACK_FRONT / 1000.0f)
 {
-    max_pitch_deg_  = rad2deg(atan2f(2.0f * r_m_, wb_m_));
-    max_roll_deg_   = rad2deg(atan2f(2.0f * r_m_, wt_f_m_));
-    float limit_cos = cosf(deg2rad(10.0f));
+    max_pitch_deg_ = rad2deg(atan2f(2.0f * r_m_, wb_m_));
+    max_roll_deg_  = rad2deg(atan2f(2.0f * r_m_, wt_f_m_));
+    // Keep working range AWAY from kinematic singularity at θ=0,π.
+    // At small |sin θ| the leg has near-zero mechanical advantage AND the
+    // impedance Kp/Kd both saturate to their floors → no damping → violent
+    // rocking. Restrict θ ∈ [30°, 150°] so sin² ≥ 0.25 always.
+    float limit_cos = cosf(deg2rad(30.0f));
     h_max_          = R_m_ + r_m_ * limit_cos;
     h_min_          = R_m_ - r_m_ * limit_cos;
-    // H = R + r * cos(theta). At 135 deg ≈ 0.114m.
-    target_chassis_height_ = R_m_ + r_m_ * cosf(deg2rad(INITIAL_LEG_ANGLE));
+    // New calibration convention: H = R − r * cos(theta). theta=0 ⇔ lowest.
+    target_chassis_height_  = R_m_ - r_m_ * cosf(deg2rad(INITIAL_LEG_ANGLE));
+    target_height_setpoint_ = target_chassis_height_;
 }
 
 void Chassis::Init()
@@ -121,7 +133,31 @@ void Chassis::Set_Mode(Chassis_State new_state)
     // Reset mode-specific compensators
     if (new_state == Chassis_State::COMFORT)
     {
-        impedance_.reset();  // Starts ramp from entry_kp → impedance values
+        impedance_.reset();  // Will start its kp ramp ONLY after homing completes
+
+        // Capture the Kp/Kd the legs were holding under the previous mode so
+        // the homing handoff doesn't release stiffness. ENERGY_SAVING uses
+        // Pos_KP=80 Kd=4.0 to nail the leg at θ=0; any sudden drop to a lower
+        // Kp releases gravity load and the chassis falls / kicks.
+        float prev_kp = 80.0f, prev_kd = 4.0f;
+        if (current_state_ == Chassis_State::ENERGY_SAVING)
+        {
+            prev_kp = 80.0f;
+            prev_kd = 4.0f;
+        }
+        else if (current_state_ == Chassis_State::IDLE)
+        {
+            prev_kp = 0.0f;
+            prev_kd = 0.5f;
+        }
+        for (int i = 0; i < 4; i++)
+        {
+            comfort_homing_kp_start_[i] = prev_kp;
+            comfort_homing_kd_start_[i] = prev_kd;
+        }
+
+        comfort_phase_        = ComfortPhase::HOMING;
+        comfort_homing_ticks_ = 0;
     }
     if (new_state == Chassis_State::CLIMBING)
     {
@@ -133,8 +169,46 @@ void Chassis::Set_Mode(Chassis_State new_state)
         // via H = R + r·cos(angle) gives the matching height.
         // This also leaves a safe low height when returning to COMFORT,
         // avoiding the θ≈0° singularity (near full extension).
-        target_chassis_height_ = CalculateHeightFromAngle(180.0f - climbing_.config().prep_theta_deg);
+        target_height_setpoint_ = CalculateHeightFromAngle(180.0f - climbing_.config().prep_theta_deg);
     }
+}
+
+void Chassis::slewTargetHeight()
+{
+    // Asymmetric slew: descending is HALF the rate of ascending.
+    // Going down, gravity helps and θ shrinks toward the singularity (sin²→0,
+    // Kp_MIT → mit_kp_min floor), so impedance authority is weakest exactly
+    // when we are commanding the most aggressive motion. Slow it down so the
+    // legs stay close to the slewing setpoint instead of free-falling into it.
+    float diff      = target_height_setpoint_ - target_chassis_height_;
+    float rate_up   = HEIGHT_SLEW_PER_CYCLE;
+    float rate_down = HEIGHT_SLEW_PER_CYCLE * 0.5f;
+    float dh_target = 0.0f;
+    if (diff > rate_up)
+        dh_target = rate_up;
+    else if (diff < -rate_down)
+        dh_target = -rate_down;
+    else
+        dh_target = diff;  // close enough: step exactly
+
+    // Jerk-limit the rate itself: instead of stepping dh from 0 to rate_up in
+    // one cycle (= infinite jerk), smooth dh with a one-pole LPF (~80 ms tau).
+    // Effect: target_chassis_height_ profile becomes an S-curve, with finite
+    // acceleration at start and stop. Ascent feels "smooth" instead of yank.
+    static float dh_filt   = 0.0f;
+    const float jerk_alpha = 0.06f;  // tau ≈ 80ms @ 500Hz
+    dh_filt                = jerk_alpha * dh_target + (1.0f - jerk_alpha) * dh_filt;
+
+    target_chassis_height_ += dh_filt;
+    if (fabsf(dh_target) < 1e-7f && fabsf(dh_filt) < 1e-7f)
+        target_chassis_height_ = target_height_setpoint_;  // snap when fully settled
+
+    // Record signed rate (m/s) so executeBodyControlImpedance can feed it
+    // forward into each leg's velocity command. Without this, MIT Kd resists
+    // the commanded descent (target_vel=0 but actual_vel<0 → Kd pushes up),
+    // accumulating position error until the loop "jumps" — the faster the
+    // commanded descent, the bigger the jump.
+    height_slew_rate_ = dh_filt * 500.0f;  // 500 Hz update
 }
 
 void Chassis::Update(const Protocol::PC_Msg &cmd)
@@ -171,6 +245,8 @@ void Chassis::Update(const Protocol::PC_Msg &cmd)
         if (BR_WheelLegs_)
             BR_WheelLegs_->Set_Wheel_Leg(stop_params);
 
+        // Keep DbgSummary live during disconnect so Ozone watch never freezes.
+        updateDbgSummary();
         return;
     }
 
@@ -184,11 +260,21 @@ void Chassis::Update(const Protocol::PC_Msg &cmd)
     bool mr_pressed = (current_buttons & BTN_MR);
 
     // --- TEMPORARY: only IDLE / ENERGY_SAVING / DEBUG enabled for live use ---
-    // CALIBRATION combo (ML+MR) is disabled to prevent accidental DM flash erase.
     // COMFORT / CLIMBING / FREE_CONTROL are skipped while bringup is in progress.
+    // CALIBRATION combo (ML+MR) is gated by ENABLE_DM_CALIBRATION (see
+    // handleCalibrationMode). When the macro is 0, the combo is also ignored.
+#if ENABLE_DM_CALIBRATION
+    if (ml_pressed && mr_pressed)
+    {
+        if (current_state_ != Chassis_State::CALIBRATION)
+            Set_Mode(Chassis_State::CALIBRATION);
+    }
+#endif
+
     static const Chassis_State kAllowedStates[] = {
         Chassis_State::IDLE,
         Chassis_State::ENERGY_SAVING,
+        Chassis_State::COMFORT,
         Chassis_State::DEBUG,
     };
     constexpr int kNumAllowed = sizeof(kAllowedStates) / sizeof(kAllowedStates[0]);
@@ -219,6 +305,23 @@ void Chassis::Update(const Protocol::PC_Msg &cmd)
     }
 
     last_button_status_ = current_buttons;
+
+    // Slew the consumed target height toward the discrete setpoint every cycle.
+    // Done before mode dispatch so all modes see the smoothed value.
+    slewTargetHeight();
+
+    // Tell impedance mass estimator whether the chassis target is currently
+    // slewing. While slewing, the body unloads (apparent weight drops as it
+    // accelerates downward) → leg current drops → if we let it, M_est would
+    // collapse → FFW collapses → deeper drop. Freeze the estimator instead.
+    // Also hold the freeze for ~250ms AFTER slew stops, so the arrival ring
+    // doesn't get baked into the warm-snap.
+    static int settle_hold_ticks = 0;
+    if (fabsf(height_slew_rate_) >= 1e-4f)
+        settle_hold_ticks = 125;  // 250 ms @ 500 Hz
+    else if (settle_hold_ticks > 0)
+        settle_hold_ticks--;
+    impedance_.setSettled(settle_hold_ticks == 0);
 
     switch (current_state_)
     {
@@ -296,21 +399,51 @@ void Chassis::Update(const Protocol::PC_Msg &cmd)
     dbg_leg.cmd_fr = FR_WheelLegs_ ? FR_WheelLegs_->Get_FinalLegCommand() : 0.0f;
     dbg_leg.cmd_bl = BL_WheelLegs_ ? BL_WheelLegs_->Get_FinalLegCommand() : 0.0f;
     dbg_leg.cmd_br = BR_WheelLegs_ ? BR_WheelLegs_->Get_FinalLegCommand() : 0.0f;
+
+    updateDbgSummary();
+}
+
+void Chassis::updateDbgSummary()
+{
+    // Motor angle feedback (deg). Always fresh — Get_LegPosition reads
+    // CAN feedback directly, no command pipeline needed.
+    dbg_summary.angle_fl = FL_WheelLegs_ ? FL_WheelLegs_->Get_LegPosition() : 0.0f;
+    dbg_summary.angle_fr = FR_WheelLegs_ ? FR_WheelLegs_->Get_LegPosition() : 0.0f;
+    dbg_summary.angle_bl = BL_WheelLegs_ ? BL_WheelLegs_->Get_LegPosition() : 0.0f;
+    dbg_summary.angle_br = BR_WheelLegs_ ? BR_WheelLegs_->Get_LegPosition() : 0.0f;
+
+    // Per-leg current height (m): H = R - r * cos(theta_motor).
+    // cos is even so bending_direction sign cancels out.
+    auto angle_to_h        = [this](float deg) { return R_m_ - r_m_ * cosf(deg2rad(deg)); };
+    dbg_summary.height_fl  = angle_to_h(dbg_summary.angle_fl);
+    dbg_summary.height_fr  = angle_to_h(dbg_summary.angle_fr);
+    dbg_summary.height_bl  = angle_to_h(dbg_summary.angle_bl);
+    dbg_summary.height_br  = angle_to_h(dbg_summary.angle_br);
+    dbg_summary.height_avg = 0.25f * (dbg_summary.height_fl + dbg_summary.height_fr + dbg_summary.height_bl + dbg_summary.height_br);
+
+    dbg_summary.target_height = target_chassis_height_;
+
+    // IMU snapshot (already filtered / transformed in readAndTransformIMU)
+    dbg_summary.imu_pitch      = chassis_pitch_;
+    dbg_summary.imu_roll       = chassis_roll_;
+    dbg_summary.imu_pitch_rate = chassis_pitch_rate_;
+    dbg_summary.imu_roll_rate  = chassis_roll_rate_;
+    dbg_summary.imu_accel_z    = chassis_accel_z_;
+
+    // Sprung-mass estimate from impedance controller
+    dbg_summary.mass_est = impedance_.getEstimatedMass();
+
+    dbg_summary.state = dbg_state;
 }
 
 void Chassis::handleCalibrationMode()
 {
-#if USE_HT_LEG_MOTOR
-    // Re-enter motor mode (safe if already entered; recovers from lost ENTER_MOTOR)
-    if (FL_WheelLegs_)
-        FL_WheelLegs_->EnterMotorMode();
-    if (FR_WheelLegs_)
-        FR_WheelLegs_->EnterMotorMode();
-    if (BL_WheelLegs_)
-        BL_WheelLegs_->EnterMotorMode();
-    if (BR_WheelLegs_)
-        BR_WheelLegs_->EnterMotorMode();
-
+    // DM motors don't need ENTER_MOTOR ritual.
+    //
+    // SetZero() calls setZeroPosition(), which WRITES THE DM MOTOR'S FLASH and
+    // permanently relocates the absolute encoder zero. Gated by
+    // ENABLE_DM_CALIBRATION (file-scope macro near the top of this file).
+#if ENABLE_DM_CALIBRATION
     if (FL_WheelLegs_)
         FL_WheelLegs_->SetZero();
     if (FR_WheelLegs_)
@@ -319,25 +452,6 @@ void Chassis::handleCalibrationMode()
         BL_WheelLegs_->SetZero();
     if (BR_WheelLegs_)
         BR_WheelLegs_->SetZero();
-#elif USE_DM_LEG_MOTOR
-    // DM motors don't need ENTER_MOTOR ritual.
-    //
-    // SetZero() calls setZeroPosition(), which WRITES THE DM MOTOR'S FLASH and
-    // permanently relocates the absolute encoder zero. Calling it on every
-    // CALIBRATION entry is dangerous:
-    //   - It silently invalidates DM_LEG_ID*_OFFSET in Robot_Params.hpp.
-    //   - Repeated flash writes wear out the motor's flash.
-    //   - Whatever pose the leg happens to be in becomes the new zero,
-    //     usually NOT what you want.
-    //
-    // Calibrate manually via the DM Tool (or a one-shot debug build) instead.
-    // Leave the calls disabled here so accidentally entering CALIBRATION never
-    // corrupts the per-motor zero.
-    //
-    // if (FL_WheelLegs_) FL_WheelLegs_->SetZero();
-    // if (FR_WheelLegs_) FR_WheelLegs_->SetZero();
-    // if (BL_WheelLegs_) BL_WheelLegs_->SetZero();
-    // if (BR_WheelLegs_) BR_WheelLegs_->SetZero();
 #endif
     Set_Mode(Chassis_State::IDLE);
 }
@@ -388,6 +502,11 @@ void Chassis::readAndTransformIMU()
     if (raw_roll < -180.0f)
         raw_roll += 360.0f;
 
+    // Level-trim: subtract mounting-tilt offsets measured on flat ground so
+    // "perfectly level" reads (0, 0) in chassis frame. See Robot_Params.hpp.
+    raw_pitch -= IMU_PITCH_OFFSET_DEG;
+    raw_roll -= IMU_ROLL_OFFSET_DEG;
+
     // Low-pass filter angles (cutoff ≈ 4 Hz @ 500 Hz)
     // Prevents motor vibration from feeding back through IMU into PID
     constexpr float imu_alpha = 0.02f;
@@ -419,47 +538,45 @@ void Chassis::readAndTransformIMU()
 void Chassis::handleHeightButtons(const Protocol::PC_Msg &cmd)
 {
     //==========================================================================================
-    //============ Button Mappings for Target Heights + Bending Direction =======================
+    // COMFORT button mappings: choose target chassis height (in meters).
     //
-    // Standard (BEND_STD): all legs same direction (outward)
-    // Inverted (BEND_INV): front reversed, back normal (inward / 收缩)
+    // NOTE: COMFORT mode INTENTIONALLY does NOT touch bending_direction_. The
+    // per-leg bending sign is configured statically in Robot_Config.cpp and
+    // describes mechanical mounting — it should never be flipped at runtime.
+    // Old code used to call SetBendingDirection() here; that was removed.
+    //
+    // theta convention: theta=0 ⇔ lowest pose, |theta|=180 ⇔ highest pose.
     //==========================================================================================
 
-    // X: 90 deg — standard stance
+    // X: 90 deg — mid stance
     if (cmd.button_status & BTN_X)
     {
-        target_chassis_height_ = CalculateHeightFromAngle(90.0f);
-        SetBendingDirection(BEND_STD_FL, BEND_STD_FR, BEND_STD_BL, BEND_STD_BR);
+        target_height_setpoint_ = CalculateHeightFromAngle(90.0f);
     }
-    // Y: 145 deg — standard stance
+    // Y: 145 deg — high stance
     else if (cmd.button_status & BTN_Y)
     {
-        target_chassis_height_ = CalculateHeightFromAngle(145.0f);
-        SetBendingDirection(BEND_STD_FL, BEND_STD_FR, BEND_STD_BL, BEND_STD_BR);
+        target_height_setpoint_ = CalculateHeightFromAngle(145.0f);
     }
-    // A: 45 deg — standard stance
+    // A: 45 deg — low stance
     else if (cmd.button_status & BTN_A)
     {
-        target_chassis_height_ = CalculateHeightFromAngle(45.0f);
-        SetBendingDirection(BEND_STD_FL, BEND_STD_FR, BEND_STD_BL, BEND_STD_BR);
+        target_height_setpoint_ = CalculateHeightFromAngle(45.0f);
     }
-    // B: 165 deg — standard stance
+    // B: 165 deg — highest stance
     else if (cmd.button_status & BTN_B)
     {
-        target_chassis_height_ = CalculateHeightFromAngle(165.0f);
-        SetBendingDirection(BEND_STD_FL, BEND_STD_FR, BEND_STD_BL, BEND_STD_BR);
+        target_height_setpoint_ = CalculateHeightFromAngle(165.0f);
     }
-    // RB: 135 deg — inward stance (front reversed, back normal)
+    // RB: 135 deg
     else if (cmd.button_status & BTN_RB)
     {
-        target_chassis_height_ = CalculateHeightFromAngle(135.0f);
-        SetBendingDirection(BEND_INV_FL, BEND_INV_FR, BEND_INV_BL, BEND_INV_BR);
+        target_height_setpoint_ = CalculateHeightFromAngle(135.0f);
     }
-    // LB: 90 deg — inward stance (front reversed, back normal)
+    // LB: 90 deg
     else if (cmd.button_status & BTN_LB)
     {
-        target_chassis_height_ = CalculateHeightFromAngle(90.0f);
-        SetBendingDirection(BEND_INV_FL, BEND_INV_FR, BEND_INV_BL, BEND_INV_BR);
+        target_height_setpoint_ = CalculateHeightFromAngle(90.0f);
     }
 }
 
@@ -542,9 +659,51 @@ void Chassis::executeBodyControl(const Protocol::PC_Msg &cmd, const float mode_d
 // =====================================================================
 void Chassis::executeBodyControlImpedance(const Protocol::PC_Msg &cmd)
 {
-    // 1. Body Leveling PID (same as position-based path)
-    float roll_h_adj  = roll_pid(0.0f, clampSym(chassis_roll_, max_roll_deg_));
-    float pitch_h_adj = pitch_pid(0.0f, clampSym(chassis_pitch_, max_pitch_deg_));
+    // 1. Body Leveling PID — LOW-BANDWIDTH version for COMFORT.
+    //
+    // The impedance loop already absorbs bumps (each leg has natural ω_n ≈
+    // 9 Hz at θ=90°). Body leveling should only correct STEADY tilt (e.g.
+    // weight shift, slope), NOT chase per-wheel bump transients. If PID sees
+    // raw IMU it amplifies the 5-15 Hz bump components into commanded height
+    // steps that excite the leg resonance → violent terrain shaking.
+    //
+    // → LPF the IMU angles to ~1 Hz before feeding to PID. PID becomes a
+    //   slow trim loop; bumps stay inside impedance's bandwidth.
+    static float roll_lpf  = 0.0f;
+    static float pitch_lpf = 0.0f;
+    const float lvl_alpha  = 0.02f;  // tau ≈ 100ms @ 500Hz → ~1.6 Hz cutoff.
+                                     // Tuning history: 0.01 (slow trim OK but
+                                     // 调平 felt slow) → 0.04 (self-excited
+                                     // with scale 0.8) → 0.02 mid-ground. Well
+                                     // below leg ω_n≈9Hz so the bump-shake mode
+                                     // isn't re-excited.
+    roll_lpf  = lvl_alpha * chassis_roll_ + (1.0f - lvl_alpha) * roll_lpf;
+    pitch_lpf = lvl_alpha * chassis_pitch_ + (1.0f - lvl_alpha) * pitch_lpf;
+
+    float roll_h_adj  = roll_pid(0.0f, clampSym(roll_lpf, max_roll_deg_));
+    float pitch_h_adj = pitch_pid(0.0f, clampSym(pitch_lpf, max_pitch_deg_));
+
+    // Halve the leveling authority in COMFORT — impedance + Kd already provide
+    // most of the disturbance rejection; the PID just trims slow tilt.
+    const float comfort_pid_scale = 0.7f;  // Tuning history: 0.5 (no step-climb
+                                           // authority) → 0.8 + 3.2Hz LPF (self-
+                                           // excited) → 0.7 + 0.8Hz LPF as the
+                                           // stability-preserving middle ground.
+                                           // Keep LPF at 0.01 (~0.8Hz) so high-
+                                           // frequency content can't enter the
+                                           // loop; just give the slow trim more
+                                           // authority.
+    roll_h_adj *= comfort_pid_scale;
+    pitch_h_adj *= comfort_pid_scale;
+
+    // Gate PID differential by impedance ramp_alpha (0→1 over ~0.4s) so we
+    // never command a wide pitch/roll spread while legs are still at the
+    // mode-entry pose and impedance Kp is climbing. Otherwise: entry @ θ≈0
+    // (e.g. coming from ENERGY_SAVING which holds Leg_POS=0) + immediate
+    // ±0.08m differential = legs slammed to ±70° with stiff Kp = explosion.
+    float pid_gate = impedance_.getRampAlpha();
+    roll_h_adj *= pid_gate;
+    pitch_h_adj *= pid_gate;
 
     // 2. Gyro Feedforward (disabled — set ff_gain > 0 to re-enable after tuning)
     static float filt_pitch_rate_i = 0.0f, filt_roll_rate_i = 0.0f;
@@ -554,6 +713,14 @@ void Chassis::executeBodyControlImpedance(const Protocol::PC_Msg &cmd)
     float v_pitch_ff  = (wb_m_ / 2.0f) * filt_pitch_rate_i * ff_gain;
     float v_roll_ff   = (wt_f_m_ / 2.0f) * filt_roll_rate_i * ff_gain;
 
+    // Vertical velocity feedforward from the (jerk-limited) height slew. All
+    // four legs share the same commanded vertical rate. Without this, MIT Kd
+    // sees target_vel=0 while actual_vel≠0 during slew → Kd resists commanded
+    // motion → position error accumulates → loop "snaps". height_slew_rate_
+    // is already LPF-smoothed in slewTargetHeight() so no extra filter needed
+    // here.
+    float v_chassis = height_slew_rate_;
+
     // 3. Per-leg height + impedance params → Set_Leg_Height(h, v, kp, kd, ffw)
     //    PID offsets for pitch/roll leveling are position commands; Kp/Kd/FFW handle compliance.
     auto &out_fl = impedance_.getLegOutput(0);
@@ -562,26 +729,26 @@ void Chassis::executeBodyControlImpedance(const Protocol::PC_Msg &cmd)
     auto &out_br = impedance_.getLegOutput(3);
 
     // FL (Front-Left): +Pitch, -Roll
-    float h_fl = clampHeight(target_chassis_height_ + pitch_h_adj - roll_h_adj);
-    float v_fl = v_pitch_ff - v_roll_ff;
+    float h_fl = clampHeight(target_chassis_height_ + pitch_h_adj - roll_h_adj + ground_contact_.getDeltaH(0));
+    float v_fl = v_chassis + v_pitch_ff - v_roll_ff;
     if (FL_WheelLegs_)
         FL_WheelLegs_->Set_Leg_Height(h_fl, v_fl, out_fl.kp, out_fl.kd, out_fl.ffw_torque);
 
     // FR (Front-Right): +Pitch, +Roll
-    float h_fr = clampHeight(target_chassis_height_ + pitch_h_adj + roll_h_adj);
-    float v_fr = v_pitch_ff + v_roll_ff;
+    float h_fr = clampHeight(target_chassis_height_ + pitch_h_adj + roll_h_adj + ground_contact_.getDeltaH(1));
+    float v_fr = v_chassis + v_pitch_ff + v_roll_ff;
     if (FR_WheelLegs_)
         FR_WheelLegs_->Set_Leg_Height(h_fr, v_fr, out_fr.kp, out_fr.kd, out_fr.ffw_torque);
 
     // BL (Back-Left): -Pitch, -Roll
-    float h_bl = clampHeight(target_chassis_height_ - pitch_h_adj - roll_h_adj);
-    float v_bl = -v_pitch_ff - v_roll_ff;
+    float h_bl = clampHeight(target_chassis_height_ - pitch_h_adj - roll_h_adj + ground_contact_.getDeltaH(2));
+    float v_bl = v_chassis - v_pitch_ff - v_roll_ff;
     if (BL_WheelLegs_)
         BL_WheelLegs_->Set_Leg_Height(h_bl, v_bl, out_bl.kp, out_bl.kd, out_bl.ffw_torque);
 
     // BR (Back-Right): -Pitch, +Roll
-    float h_br = clampHeight(target_chassis_height_ - pitch_h_adj + roll_h_adj);
-    float v_br = -v_pitch_ff + v_roll_ff;
+    float h_br = clampHeight(target_chassis_height_ - pitch_h_adj + roll_h_adj + ground_contact_.getDeltaH(3));
+    float v_br = v_chassis - v_pitch_ff + v_roll_ff;
     if (BR_WheelLegs_)
         BR_WheelLegs_->Set_Leg_Height(h_br, v_br, out_br.kp, out_br.kd, out_br.ffw_torque);
 
@@ -622,29 +789,117 @@ void Chassis::executeBodyControlImpedance(const Protocol::PC_Msg &cmd)
 
 // =====================================================================
 // COMFORT MODE: Variable Impedance Control (Kp/Kd/FFW modulation)
+//
+// Internal sub-state machine:
+//   HOMING (first ~0.4s) — drive legs from arbitrary pose (esp. θ≈0 from
+//     ENERGY_SAVING) to θ = ±COMFORT_HOMING_THETA away from the kinematic
+//     singularity. Uses Set_Leg_Target with low Kp; wheels held at 0 RPM.
+//     Impedance controller is NOT updated yet so its mass estimation and
+//     PID gating ramp stay frozen.
+//   RUN — normal variable-impedance + body-leveling control.
 // =====================================================================
 void Chassis::handleComfortMode(const Protocol::PC_Msg &cmd)
 {
-    // IMU already updated at top of Update()
+    Wheel_Leg *legs[4] = {FL_WheelLegs_, FR_WheelLegs_, BL_WheelLegs_, BR_WheelLegs_};
 
+    // --------- HOMING sub-state ---------
+    if (comfort_phase_ == ComfortPhase::HOMING)
+    {
+        // Linear angle ramp from each leg's current angle (captured on tick 0)
+        // toward target = ±COMFORT_HOMING_THETA, signed by bending direction.
+        // Simultaneously ramp Kp/Kd from the previous mode's stiffness toward
+        // COMFORT_HOMING_KP_END so legs are NEVER released — only made gentler.
+        static float homing_start_angle[4] = {0};
+        if (comfort_homing_ticks_ == 0)
+        {
+            for (int i = 0; i < 4; i++)
+                homing_start_angle[i] = legs[i] ? legs[i]->Get_LegPosition() : 0.0f;
+        }
+
+        float alpha = (float)comfort_homing_ticks_ / (float)COMFORT_HOMING_FRAMES;
+        if (alpha > 1.0f)
+            alpha = 1.0f;
+        // Smoothstep for gentler accel/decel at endpoints
+        float s = alpha * alpha * (3.0f - 2.0f * alpha);
+
+        for (int i = 0; i < 4; i++)
+        {
+            if (!legs[i])
+                continue;
+            float target_deg = COMFORT_HOMING_THETA * (float)legs[i]->Get_Bending_Direction();
+            float cmd_deg    = homing_start_angle[i] + s * (target_deg - homing_start_angle[i]);
+            float kp_use     = comfort_homing_kp_start_[i] + alpha * (COMFORT_HOMING_KP_END - comfort_homing_kp_start_[i]);
+            float kd_use     = comfort_homing_kd_start_[i] + alpha * (COMFORT_HOMING_KD_END - comfort_homing_kd_start_[i]);
+            legs[i]->Set_Leg_Target(cmd_deg, 0.0f, 0.0f, kp_use, kd_use);
+            legs[i]->Set_Wheel_Target(0.0f);
+        }
+
+        comfort_homing_ticks_++;
+        if (comfort_homing_ticks_ >= COMFORT_HOMING_FRAMES)
+        {
+            // Seed target_chassis_height_ to the post-homing height so the
+            // first RUN cycle commands what the legs are already at.
+            float h_homed           = CalculateHeightFromAngle(COMFORT_HOMING_THETA);
+            target_chassis_height_  = clampHeight(h_homed);
+            target_height_setpoint_ = target_chassis_height_;
+            // Continuity: make impedance ramp start from HOMING's exit Kp/Kd,
+            // not from the static defaults. Otherwise Kd jumps 2.0 → 1.5 at
+            // the handoff and the legs lose damping for one cycle → twitch.
+            impedance_.config().entry_kp = COMFORT_HOMING_KP_END;
+            impedance_.config().entry_kd = COMFORT_HOMING_KD_END;
+            comfort_phase_               = ComfortPhase::RUN;
+        }
+
+        executeMotorCommands();
+        return;
+    }
+
+    // --------- RUN sub-state (normal impedance) ---------
     // 2. Button → Target Height
     handleHeightButtons(cmd);
 
     // 3. Gather per-leg data
-    float leg_currents[4] = {FL_WheelLegs_ ? FL_WheelLegs_->Get_LegCurrentFeedback() : 0.0f,
-                             FR_WheelLegs_ ? FR_WheelLegs_->Get_LegCurrentFeedback() : 0.0f,
-                             BL_WheelLegs_ ? BL_WheelLegs_->Get_LegCurrentFeedback() : 0.0f,
-                             BR_WheelLegs_ ? BR_WheelLegs_->Get_LegCurrentFeedback() : 0.0f};
+    float leg_currents[4] = {legs[0] ? legs[0]->Get_LegCurrentFeedback() : 0.0f,
+                             legs[1] ? legs[1]->Get_LegCurrentFeedback() : 0.0f,
+                             legs[2] ? legs[2]->Get_LegCurrentFeedback() : 0.0f,
+                             legs[3] ? legs[3]->Get_LegCurrentFeedback() : 0.0f};
 
-    float leg_angles[4] = {FL_WheelLegs_ ? FL_WheelLegs_->Get_LegPosition() : 90.0f,
-                           FR_WheelLegs_ ? FR_WheelLegs_->Get_LegPosition() : 90.0f,
-                           BL_WheelLegs_ ? BL_WheelLegs_->Get_LegPosition() : 90.0f,
-                           BR_WheelLegs_ ? BR_WheelLegs_->Get_LegPosition() : 90.0f};
+    float leg_angles[4] = {legs[0] ? legs[0]->Get_LegPosition() : 0.0f,
+                           legs[1] ? legs[1]->Get_LegPosition() : 0.0f,
+                           legs[2] ? legs[2]->Get_LegPosition() : 0.0f,
+                           legs[3] ? legs[3]->Get_LegPosition() : 0.0f};
 
     const float dt = 0.002f;  // 500 Hz
 
     // 4. Update Impedance Controller → per-leg Kp, Kd, FFW
     impedance_.update(leg_currents, leg_angles, chassis_accel_z_, chassis_roll_rate_, chassis_pitch_rate_, dt);
+
+    // 4b. Update Ground Contact (warp) compensator. Roll+Pitch PID controls
+    //     only 2 of 3 tilt DOFs; the diagonal "warp" mode is uncontrolled and
+    //     lets one wheel lift off (e.g. FR on a step → FL+BR unloaded).
+    //     Ground Contact senses current imbalance between diagonals and adds
+    //     a small per-leg height bias orthogonal to roll/pitch.
+    //
+    //     IMPORTANT: leg_currents[] is the raw motor current, which is signed
+    //     by bending_direction (front legs bend opposite to back legs). For a
+    //     SAME downward ground reaction, FL motor torque has opposite sign to
+    //     BL motor torque. We must normalize so that "more ground load" = more
+    //     positive across all legs before computing the diagonal warp error.
+    float i_norm[4];
+    Wheel_Leg *legs_arr[4] = {FL_WheelLegs_, FR_WheelLegs_, BL_WheelLegs_, BR_WheelLegs_};
+    for (int i = 0; i < 4; i++)
+    {
+        float bd  = legs_arr[i] ? (float)legs_arr[i]->Get_Bending_Direction() : 1.0f;
+        i_norm[i] = leg_currents[i] * bd;
+    }
+    ground_contact_.update(i_norm, dt);
+
+    dbg_gc.warp_error = ground_contact_.getWarpError();
+    dbg_gc.warp_dh    = ground_contact_.getWarpDH();
+    dbg_gc.dh_fl      = ground_contact_.getDeltaH(0);
+    dbg_gc.dh_fr      = ground_contact_.getDeltaH(1);
+    dbg_gc.dh_bl      = ground_contact_.getDeltaH(2);
+    dbg_gc.dh_br      = ground_contact_.getDeltaH(3);
 
     // 5. Update debug variables
     dbg_imp.kp_fl      = impedance_.getLegOutput(0).kp;
@@ -732,48 +987,44 @@ void Chassis::handleFreeControl(const Protocol::PC_Msg &cmd)
 void Chassis::handleDebugMode(const Protocol::PC_Msg &cmd)
 {
     // ------------------------------------------------------------------
-    // DEBUG: direct per-leg position targets (radians, raw feedback frame).
-    // Bypasses Set_Leg_Height / inverse kinematics — values are sent straight
-    // to DM via setMIT (after deg-conversion in Execute_Leg_Control).
+    // DEBUG: trigger-driven LOGICAL-frame target for ALL 4 legs.
+    //   RT (Right_trigger_x1000_msg / 1000)  → +theta_logical
+    //   LT (Left_trigger_x1000_msg  / 1000)  → -theta_logical
+    // Net logical target = (RT - LT) * MAX_DEBUG_RAD.
     //
-    // Reference values come from physical measurement (May 2026 bringup);
-    // not all legs land at the same numeric angle because of mechanical
-    // mounting / encoder offset differences.
-    //
-    // Order: {FL, BL, FR, BR}  (matches Wheel_Leg_Params layout)
-    //
-    //   X — wheels splayed outward, mid-stance
-    //   A — wheels splayed outward, ~45° squat (lower)
-    //   (others fall back to "hold last target")
+    // Each leg's raw motor target = logical * bending_direction_ (per leg),
+    // so when bending_direction_ is correct, RT makes ALL FOUR LEGS bend in
+    // the SAME physical direction. If one leg goes the wrong way, flip its
+    // bending direction in Robot_Config.cpp.
     // ------------------------------------------------------------------
 
-    static float last_target_rad[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float target_rad[4]             = {last_target_rad[0], last_target_rad[1], last_target_rad[2], last_target_rad[3]};
+    const float MAX_DEBUG_RAD = 2.8f;  // ~160°, stays clear of ±π wrap
 
-    if (cmd.button_status & BTN_X)
-    {
-        target_rad[0] = -1.3f;  // FL
-        target_rad[1] = +1.3f;  // BL
-        target_rad[2] = +1.3f;  // FR
-        target_rad[3] = -1.3f;  // BR
-    }
-    else if (cmd.button_status & BTN_A)
-    {
-        target_rad[0] = -2.0f;  // FL
-        target_rad[1] = +2.0f;  // BL
-        target_rad[2] = +2.0f;  // FR
-        target_rad[3] = -2.0f;  // BR
-    }
-    // Y / B currently unused — held at last_target_rad
+    float rt = (float)cmd.Right_trigger_x1000_msg / 1000.0f;
+    float lt = (float)cmd.Left_trigger_x1000_msg / 1000.0f;
+    if (rt > 1.0f)
+        rt = 1.0f;
+    if (rt < 0.0f)
+        rt = 0.0f;
+    if (lt > 1.0f)
+        lt = 1.0f;
+    if (lt < 0.0f)
+        lt = 0.0f;
 
+    float target_logical = (rt - lt) * MAX_DEBUG_RAD;
+
+    Wheel_Leg *legs[4]  = {FL_WheelLegs_, BL_WheelLegs_, FR_WheelLegs_, BR_WheelLegs_};
+    float target_rad[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int i = 0; i < 4; i++)
-        last_target_rad[i] = target_rad[i];
+    {
+        if (legs[i])
+            target_rad[i] = target_logical * (float)legs[i]->Get_Bending_Direction();
+    }
 
     // DM holding gains (same as ENERGY_SAVING)
-    const float kp = 60.0f;
-    const float kd = 2.5f;
+    const float kp = 80.0f;
+    const float kd = 4.0f;
 
-    Wheel_Leg *legs[4] = {FL_WheelLegs_, BL_WheelLegs_, FR_WheelLegs_, BR_WheelLegs_};
     for (int i = 0; i < 4; i++)
     {
         if (legs[i])
@@ -821,8 +1072,11 @@ void Chassis::handleEnergySaving(const Protocol::PC_Msg &cmd)
     // Holding torque must resist gravity at the lowest pose AND the disturbance
     // from wheel acceleration / forward-backward jerk. Too soft → leg sways,
     // sway gets amplified by joystick input and the leg goes unstable.
-    float target_kp = 60.0f;
-    float target_kd = 2.5f;
+    float target_kp = 80.0f;  // Tuning history: 60 (wheel disturbance → leg sways) →
+                              // 150 (static pitch self-oscillation) → 100 (still oscillating)
+                              // → 80. Below the pitch-mode self-osc threshold.
+    float target_kd = 4.0f;   // Heavier damping (was 2.5→3.5) to fight the wheel-induced
+                              // sway with lower Kp. DM Kd_max = 5.0; keep small headroom.
     float kp_use, kd_use;
     if (mode_transition_timer_ > 0)
     {
@@ -1317,7 +1571,9 @@ void Chassis::inverseKinematics(float vx, float vy, float wz, float *out_wheel_r
     }
 }
 
-float Chassis::CalculateHeightFromAngle(float angle_deg) { return R_m_ + r_m_ * cosf(deg2rad(angle_deg)); }
+// NEW convention: theta=0 ⇔ lowest (H = R - r), |theta|=180 ⇔ highest (H = R + r).
+// Matches Set_Leg_Height in Wheel_Leg.cpp (H = R - r*cos(theta)).
+float Chassis::CalculateHeightFromAngle(float angle_deg) { return R_m_ - r_m_ * cosf(deg2rad(angle_deg)); }
 
 void Chassis::SetBendingDirection(int fl, int fr, int bl, int br)
 {

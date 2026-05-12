@@ -319,6 +319,7 @@ class Wheel_Leg
     void Set_Wheel_Leg(Wheel_Leg_Params cmd);
 
     void Set_Bending_Direction(int dir) { bending_direction_ = dir; }
+    int Get_Bending_Direction() const { return bending_direction_; }
 
     //---------------------------------------------------------------------------------------------//
 };

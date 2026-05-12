@@ -85,13 +85,13 @@ DM10010 ID0x03 (FR) ------------------------------------ DM10010 ID0x01 (FL)
 // ==========================================
 
 // Wheel-Leg Geometry
-#define ECCENTRIC_OFFSET_r 65.0f
-#define WHEEL_RADIUS_R 160.0f
+#define ECCENTRIC_OFFSET_r 90.0f
+#define WHEEL_RADIUS_R 177.5f
 
 // Chassis Dimensions
-#define WHEEL_TRACK_FRONT 531.0f  // Distance between Front Left and Front Right
-#define WHEEL_TRACK_BACK 395.0f   // Distance between Back Left and Back Right
-#define WHEEL_BASE 270.0f         // Distance between Front Axle and Back Axle
+#define WHEEL_TRACK_FRONT 620.0f  // Distance between Front Left and Front Right
+#define WHEEL_TRACK_BACK 480.0f   // Distance between Back Left and Back Right
+#define WHEEL_BASE 385.0f         // Distance between Front Axle and Back Axle
 
 // IMU Mounting Position (Relative to Chassis Geometric Center)
 // Positive X: Forward, Positive Y: Left, Positive Z: Up
@@ -107,9 +107,16 @@ DM10010 ID0x03 (FR) ------------------------------------ DM10010 ID0x01 (FL)
 #define IMU_MOUNT_PITCH_DEG 0.0f
 #define IMU_MOUNT_YAW_DEG 90.0f
 
+// IMU level-trim offsets (degrees, in chassis frame AFTER mount transform).
+// Measured while the chassis sits perfectly level on a flat surface; we subtract
+// these from the transformed pitch/roll so "level" reads (0, 0).
+//   Reading on flat ground (May 2026): pitch = -4°, roll = +1.3°
+#define IMU_PITCH_OFFSET_DEG -4.0f
+#define IMU_ROLL_OFFSET_DEG 1.3f
+
 // Robot Physical Properties
-#define ROBOT_MASS_kg 10.0f  // Total mass of the robot in kg
-#define LEG_MASS_kg 0.5f     // Mass of the moving part of the leg (Motor + Wheel)
+#define ROBOT_MASS_kg 39.0f  // Total mass of the robot in kg
+#define LEG_MASS_kg 4.0f     // Mass of the moving part of the leg (Motor + Wheel)
 #define GRAVITY_g 9.81f      // Gravity acceleration in m/s^2
 
 // Active Suspension Parameters
@@ -147,6 +154,13 @@ DM10010 ID0x03 (FR) ------------------------------------ DM10010 ID0x01 (FL)
 #define MAX_FWD_ACCEL_RPM_PER_S 100.0f
 #define MAX_TURN_ACCEL_RPM_PER_S 100.0f
 
+// Deceleration limits (RPM per second), used when |target| < |prev| i.e. when
+// slowing down or releasing the joystick. Set lower than ACCEL to soften the
+// braking reaction torque that the wheel Kd loop dumps into the chassis — at
+// ES θ≈0 a hard wheel brake kicks the leg and excites pitch oscillation.
+#define MAX_FWD_DECEL_RPM_PER_S 40.0f
+#define MAX_TURN_DECEL_RPM_PER_S 40.0f
+
 // Maximum Leg Speed (Degrees per second)
 // Used for Slew Rate Limiter to prevent violent movements
 #define LEG_MAX_SPEED 400.0f
@@ -157,7 +171,7 @@ DM10010 ID0x03 (FR) ------------------------------------ DM10010 ID0x01 (FL)
 #define LEG_EXTENDED_THRESHOLD 45.0f  // Max allowed deviation from BASE_LEG_POS before detecting "Lifted"
 
 // Initial Configuration
-#define INITIAL_LEG_ANGLE 90.0f  // Nominal operating angle (Degrees). 0=Extended, 180=Retracted.
+#define INITIAL_LEG_ANGLE 0.0f  // Nominal operating angle (Degrees). 0=Extended, 180=Retracted.
 
 // Joystick Parameters
 #define JOYSTICK_MAX_R 1000.0f
@@ -171,7 +185,3 @@ DM10010 ID0x03 (FR) ------------------------------------ DM10010 ID0x01 (FL)
 // Backward range: [210, 330]
 #define ANGLE_BWD_MIN 210.0f
 #define ANGLE_BWD_MAX 330.0f
-
-// Trigger Control Angle Range
-#define LEG_TRIGGER_CTRL_MIN_ANGLE 200.0f
-#define LEG_TRIGGER_CTRL_MAX_ANGLE 360.0f

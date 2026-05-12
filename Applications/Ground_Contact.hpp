@@ -42,10 +42,22 @@ class GroundContact
    public:
     struct Config
     {
-        float kp          = 0.002f;   // Proportional gain (m / A)
-        float ki          = 0.0005f;  // Integral gain     (m / (A·s)) — low to avoid bias drift
-        float max_warp_dh = 0.020f;   // Max compensation  (m) — 20 mm
-        float deadband    = 0.15f;    // Ignore warp_error below this (A) — reject static current bias
+        // Tuning history:
+        //   kp=0.002, ki=0.0005, db=0.15 → "站起来后疯狂晃动"
+        //   kp=0.0005, ki=0.0001, db=0.6 → still 越抖越大 even with impedance warp
+        //     gains zeroed and 3Hz current LPF.
+        //   kp=0, ki=0 → isolated: GC was NOT the source, IMU PID was.
+        //   After PID rework (lvl_alpha=0.02, scale=0.7) → carefully re-enable
+        //   GC at kp=0.0001 (5× smaller than the last attempt) to handle the
+        //   diagonal warp DOF that pitch/roll PID can't reach.
+        //   0.0001 → felt too weak when one leg was lifted, slight residual sway.
+        //   0.0003 + ki 0.00003 → stable but warp_dh still <1mm/A, can't pull
+        //     unloaded legs to ground in time.
+        //   → kp=0.001, ki=0.0001. Per amp: ~2.5 mm dh, hits 20 mm at ~8 A.
+        float kp          = 0.001f;   // m / A
+        float ki          = 0.0001f;  // m / (A·s)
+        float max_warp_dh = 0.030f;   // raise from 20mm to 30mm headroom
+        float deadband    = 0.6f;
     };
 
     void reset();

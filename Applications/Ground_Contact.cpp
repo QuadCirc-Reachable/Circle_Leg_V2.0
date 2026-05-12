@@ -19,10 +19,21 @@ void GroundContact::update(const float leg_currents[4], float dt)
     //   positive → FL+BR carry more than FR+BL
     float raw_error = (leg_currents[0] + leg_currents[3]) * 0.5f - (leg_currents[1] + leg_currents[2]) * 0.5f;
 
+    // LPF the error before deadband — leg currents at COMFORT Kp ≈ 250 are
+    // VERY noisy (PWM ripple, chassis vibration), and any high-frequency
+    // content fed back as a height bias goes through impedance Kp → torque →
+    // chassis pitch/roll → more current noise → positive feedback shake.
+    // Cutoff ≈ 3 Hz: slow enough to ignore vibration, fast enough to follow
+    // a step terrain transient (<1 Hz).
+    static float err_lpf = 0.0f;
+    const float alpha    = 0.04f;  // ~3 Hz @ 500Hz
+    err_lpf              = alpha * raw_error + (1.0f - alpha) * err_lpf;
+
     // Deadband: ignore small errors (noise when unloaded / airborne)
-    if (raw_error > -cfg_.deadband && raw_error < cfg_.deadband)
-        raw_error = 0.0f;
-    warp_error_ = raw_error;
+    float gated = err_lpf;
+    if (gated > -cfg_.deadband && gated < cfg_.deadband)
+        gated = 0.0f;
+    warp_error_ = gated;
 
     // PI controller → drive warp_error towards zero
     warp_integral_ += warp_error_ * dt;

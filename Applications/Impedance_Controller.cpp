@@ -20,7 +20,8 @@ void Impedance_Controller::init(const Config &cfg)
 void Impedance_Controller::reset()
 {
     I_filter_       = 0.0f;
-    estimated_mass_ = 1.0f;
+    estimated_mass_ = 0.0f;
+    mass_warmed_    = false;
     raw_vel_z_      = 0.0f;
     vel_z_lpf_      = 0.0f;
     vel_z_hp_       = 0.0f;
@@ -42,16 +43,69 @@ void Impedance_Controller::update(
         ramp_alpha_ = 1.0f;
 
     // ================================================================
-    // 1. Mass Estimation from total motor current (slow LPF)
-    //    M_est = LPF(Σ|Iᵢ|) × KA × GR / g
+    // 1. Mass Estimation from per-leg output torque
+    //    DM J10010L_2EC feedback τ_i is OUTPUT torque in Nm (not amps),
+    //    decoded with tMax=200 Nm. Static balance per leg:
+    //        |τ_i| = (M/4 + m_leg) · g · r · |sin θ_i|
+    //    ⇒  load_i = |τ_i| / (g · r · |sin θ_i|)
+    //    M_est ≈ Σ load_i − 4·m_leg
+    //
+    // Singularity guard: skip the whole update if ANY leg has |sin θ| too
+    // small. At θ≈0,π the static formula has zero denominator, and any
+    // tracking-error torque from a stiff Kp gets divided by ~0 → inflated
+    // load → M_est explodes (saw 82 kg under no load when entering COMFORT
+    // from ENERGY_SAVING with legs at θ=0). Hold previous estimate instead.
     // ================================================================
-    float I_total = absF(leg_currents[0]) + absF(leg_currents[1]) + absF(leg_currents[2]) + absF(leg_currents[3]);
+    constexpr float sin_valid_threshold = 0.30f;  // ≈ 17.5°; below this skip update
+    // Gate: only update when impedance fully engaged AND chassis is settled
+    // (vertical body vel < threshold). Otherwise the estimator observes
+    // transient self-commanded torque and feeds back as a slow positive loop.
+    // NOTE: must gate on vel_z_hp_ (the true body vertical velocity), NOT on
+    // vel_z_lpf_, which is the LPF used as the DC bias reference and equals
+    // the slowly drifting integral of accel_z — that signal almost never sits
+    // near zero, so gating on it would freeze the estimator forever.
+    bool mass_update_valid = (ramp_alpha_ >= 0.95f) && external_settled_ && (absF(vel_z_hp_) < cfg_.mass_update_v_thresh);
+    float load_sum         = 0.0f;
+    for (int i = 0; i < 4; i++)
+    {
+        float s_motor = sinf(leg_angles_deg[i] * DEG2RAD);  // signed sin(θ_motor)
+        if (absF(s_motor) < sin_valid_threshold)
+        {
+            mass_update_valid = false;
+            break;
+        }
+        // Static balance: τ_i = (M/4 + m_leg) · g · r · sin(θ_motor_i)
+        // ⇒ load_i_per_leg = τ_i / (g · r · sin(θ_motor_i))   [SIGNED, no abs!]
+        //
+        // Using abs(τ) would bias M_est upward during oscillation: |τ_req + δ|
+        // averaged over a cycle exceeds |τ_req|, so an oscillating leg makes
+        // M_est grow → FFW grows → drives oscillation harder. Classic positive
+        // feedback. Signed form is unbiased under symmetric oscillation.
+        load_sum += leg_currents[i] / (GRAVITY * r * s_motor);
+    }
 
-    I_filter_ = cfg_.ffw_lpf_alpha * I_total + (1.0f - cfg_.ffw_lpf_alpha) * I_filter_;
+    if (mass_update_valid)
+    {
+        float M_inst = load_sum - 4.0f * cfg_.leg_mass;
+        if (M_inst < 0.0f)
+            M_inst = 0.0f;
+        if (!mass_warmed_)
+        {
+            // First good sample after entering COMFORT: snap (no LPF lag) so
+            // FFW starts at the right level immediately. Otherwise legs sag
+            // for ~1 s while LPF crawls up from 0.
+            I_filter_    = M_inst;
+            mass_warmed_ = true;
+        }
+        else
+        {
+            I_filter_ = cfg_.ffw_lpf_alpha * M_inst + (1.0f - cfg_.ffw_lpf_alpha) * I_filter_;
+        }
+    }
 
-    estimated_mass_ = (I_filter_ * cfg_.ka_times_gr) / GRAVITY;
-    if (estimated_mass_ < 1.0f)
-        estimated_mass_ = 1.0f;
+    estimated_mass_ = I_filter_;
+    if (estimated_mass_ < 0.0f)
+        estimated_mass_ = 0.0f;
 
     float load_per_leg = estimated_mass_ / 4.0f + cfg_.leg_mass;
 
@@ -131,11 +185,15 @@ void Impedance_Controller::update(
         outputs_[i].kd = cfg_.entry_kd + ramp_alpha_ * (raw_kd - cfg_.entry_kd);
 
         // --- FFW: dynamic gravity compensation + warp ground-seeking offset ---
-        // Gravity comp: τ_ff = −load · g · r · sin(θ)  (auto-correct for both bending dirs)
+        // New calibration convention: H = R − r·cos(θ_logical), θ=0 is LOWEST.
+        //   PE = const − M·g·r·cos(θ_logical) → τ_grav = −M·g·r·sin(θ_logical)
+        //   Hold torque = −τ_grav = +M·g·r·sin(θ_logical)
+        // leg_angles_deg[i] is motor angle (signed by bending_direction), so
+        //   sin(θ_motor) already encodes the lift direction in motor frame.
+        //   Therefore ffw = +load·g·r·sin(θ_motor) works for both bending dirs.
         // Warp FFW: −warp_sign pushes underloaded legs toward ground.
-        //   No bend_sign: current signs already encode bending direction.
         float warp_ffw_offset  = -warp_sign[i] * warp_clamped * cfg_.warp_ffw_gain;
-        outputs_[i].ffw_torque = -(load_per_leg * GRAVITY * r * sin_theta) + warp_ffw_offset;
+        outputs_[i].ffw_torque = +(load_per_leg * GRAVITY * r * sin_theta) + warp_ffw_offset;
     }
 }
 

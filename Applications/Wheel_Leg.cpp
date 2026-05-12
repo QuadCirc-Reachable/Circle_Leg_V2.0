@@ -216,8 +216,15 @@ void Wheel_Leg::Execute_Wheel_Control()
         // velocity-feedback term in the OR avoids torque disable while the
         // wheel is still coasting.
         constexpr float WHEEL_RPM_DEADZONE = 2.0f;
-        constexpr float WHEEL_KD           = 1.5f;  // N·m·s/rad, tune for response/damping
-        constexpr float RPM_TO_RADS        = 2.0f * (float)M_PI / 60.0f;
+        constexpr float WHEEL_KD           = 2.0f;  // N·m·s/rad. Tuning history:
+                                                    //   1.5 → static friction stall in turns
+                                                    //   3.0 → strong brake torque on release
+                                                    //         excites chassis pitch (inertia
+                                                    //         carries wheel forward → big
+                                                    //         neg error → big brake → reaction
+                                                    //         pitches chassis → loop)
+                                                    //   2.0 → compromise. HT8115 Kd_max=5.0.
+        constexpr float RPM_TO_RADS = 2.0f * (float)M_PI / 60.0f;
 
         const float vel_fb_rpm = wheel_motor->getRPMFeedback();
 
@@ -253,30 +260,30 @@ void Wheel_Leg::Set_Leg_Target(float pos_cmd, float vel_cmd, float for_cmd, floa
 
 void Wheel_Leg::Set_Leg_Height(float h_meters, float v_meters_s)
 {
-    // Convert Height (m) to Angle (deg)
-    // Model: H = R + r * cos(theta)
-    // H: Total height from ground to motor center
-    // R: Wheel Radius
-    // r: Eccentric Offset
-    // theta: Leg Angle (0 = Fully Extended/Highest, 180 = Fully Retracted/Lowest)
+    // Convert Height (m) -> Angle (deg).
+    //
+    // NEW convention (after DM zero-point was calibrated at the LOWEST pose):
+    //   theta = 0       ⇒ LOWEST  (H = R - r)
+    //   theta = ±180°    ⇒ HIGHEST (H = R + r)
+    // Model:  H = R - r * cos(theta)
+    //
+    // bending_direction_ then chooses whether to express theta as positive or
+    // negative when sending to the motor (mechanical mounting may flip the
+    // sign of one or more legs).
 
     float R = WHEEL_RADIUS_R / 1000.0f;      // m
     float r = ECCENTRIC_OFFSET_r / 1000.0f;  // m
 
-    // Clamp height to reachable physical limits
-    // Max Height = R + r
-    // Min Height = R - r
-    // Apply Safety Margin to avoid Singularity (0 and 180 degrees)
-    // Limit to [10, 170] degrees
+    // Reachable range (with 10° margin away from singularities at theta=0/180).
+    //   H_min = R - r * cos(10°)   (very low, but not at the singularity)
+    //   H_max = R + r * cos(10°)
     float limit_angle_deg = 10.0f;
     float limit_cos       = cosf(deg2rad(limit_angle_deg));
-
-    float max_h = R + r * limit_cos;
-    float min_h = R - r * limit_cos;
+    float max_h           = R + r * limit_cos;
+    float min_h           = R - r * limit_cos;
 
     bool is_clamped_max = false;
     bool is_clamped_min = false;
-
     if (h_meters > max_h)
     {
         h_meters       = max_h;
@@ -287,49 +294,28 @@ void Wheel_Leg::Set_Leg_Height(float h_meters, float v_meters_s)
         h_meters       = min_h;
         is_clamped_min = true;
     }
-
-    // Safety: Zero out velocity feedforward if pushing against the limits
     if (is_clamped_max && v_meters_s > 0.0f)
-    {
-        v_meters_s = 0.0f;  // Trying to extend further than max
-    }
+        v_meters_s = 0.0f;
     if (is_clamped_min && v_meters_s < 0.0f)
-    {
-        v_meters_s = 0.0f;  // Trying to retract further than min
-    }
+        v_meters_s = 0.0f;
 
-    // Solve for theta: cos(theta) = (H - R) / r
-    float cos_theta = (h_meters - R) / r;
-
-    // Safety clamp for acos domain [-1, 1]
+    // Solve  cos(theta) = (R - H) / r   (flip vs old convention).
+    float cos_theta = (R - h_meters) / r;
     if (cos_theta > 1.0f)
         cos_theta = 1.0f;
     if (cos_theta < -1.0f)
         cos_theta = -1.0f;
 
-    float theta_rad = acosf(cos_theta);
+    float theta_rad = acosf(cos_theta);  // [0, pi], 0 = lowest
     float theta_deg = rad2deg(theta_rad);
-
-    // Calculate Angular Velocity Feedforward
-    // H = R + r * cos(theta)
-    // dH/dt = -r * sin(theta) * dtheta/dt
-    // dtheta/dt = -dH/dt / (r * sin(theta))
-
     float sin_theta = sinf(theta_rad);
 
-    // Add a small value to denominator to avoid division by zero and dampen the singularity
-    // This replaces the hard threshold cut-off which caused shaking
+    // dH/dtheta = +r*sin(theta)  ⇒  dtheta/dt = (dH/dt) / (r*sin(theta))
+    // (sign flipped vs old formula).
     float damping_val      = 0.1f;
-    float target_vel_rad_s = -v_meters_s / (r * (sin_theta + damping_val));
+    float target_vel_rad_s = v_meters_s / (r * (sin_theta + damping_val));
 
-    // acos returns [0, 180].
-    // 0 deg -> cos=1 -> H=R+r (Max)
-    // 180 deg -> cos=-1 -> H=R-r (Min)
-    // This matches the standard definition where 0 is down (extended).
-
-    // Apply Bending Direction Preference
-    // If bending_direction_ is 1, we use +theta (0 to 180)
-    // If bending_direction_ is -1, we use -theta (0 to -180)
+    // Per-leg bending direction handles mechanical mounting sign.
     float target_angle = theta_deg * (float)bending_direction_;
     target_vel_rad_s *= (float)bending_direction_;
 
@@ -365,7 +351,8 @@ void Wheel_Leg::Set_Leg_Height(float h_meters, float v_meters_s, float kp, float
             v_meters_s = 0.0f;
     }
 
-    float cos_theta = (h_meters - R) / r;
+    // Solve  cos(theta) = (R - H) / r  (new convention, theta=0 ⇔ lowest)
+    float cos_theta = (R - h_meters) / r;
     if (cos_theta > 1.0f)
         cos_theta = 1.0f;
     if (cos_theta < -1.0f)
@@ -376,7 +363,7 @@ void Wheel_Leg::Set_Leg_Height(float h_meters, float v_meters_s, float kp, float
     float sin_theta = sinf(theta_rad);
 
     float damping_val      = 0.1f;
-    float target_vel_rad_s = -v_meters_s / (r * (sin_theta + damping_val));
+    float target_vel_rad_s = v_meters_s / (r * (sin_theta + damping_val));
 
     float target_angle = theta_deg * (float)bending_direction_;
     target_vel_rad_s *= (float)bending_direction_;
@@ -394,32 +381,37 @@ void Wheel_Leg::Add_Leg_Compensation(float comp_pos, float comp_vel, float comp_
 
 void Wheel_Leg::Execute_Leg_Control()
 {
-    float raw_target_pos = target_leg_pos + leg_compensation_pos;
+    // All leg angles are kept inside [-180°, 180°] throughout the pipeline.
+    // (Project convention: any 2π equivalent collapses to the single-turn
+    // representative. Mismatches between accumulated prev_leg_pos_cmd and the
+    // wrapped feedback used to cause ±180° boundary stalls / direction flips.)
 
-    // Unwrap target position relative to previous command to find shortest path
-    // and avoid jumps for the Slew Rate Limiter
-    float diff = raw_target_pos - prev_leg_pos_cmd;
-    // Normalize diff to [-180, 180]
-    while (diff > 180.0f)
-        diff -= 360.0f;
-    while (diff < -180.0f)
-        diff += 360.0f;
+    auto wrap180 = [](float a)
+    {
+        while (a > 180.0f)
+            a -= 360.0f;
+        while (a <= -180.0f)
+            a += 360.0f;
+        return a;
+    };
 
-    raw_target_pos = prev_leg_pos_cmd + diff;
+    float raw_target_pos = wrap180(target_leg_pos + leg_compensation_pos);
+    float prev           = wrap180(prev_leg_pos_cmd);
 
-    // Slew Rate Limiter (Ramp)
-    // Limit the change in position per update to prevent violent movements
-    // Assuming 2ms update rate (500Hz)
+    // Shortest signed diff in (-180, 180]
+    float diff = wrap180(raw_target_pos - prev);
+
+    // Slew Rate Limiter (Ramp) — 2 ms tick (500 Hz)
     float dt        = 0.002f;
     float max_delta = LEG_MAX_SPEED * dt;
+    if (diff > max_delta)
+        diff = max_delta;
+    else if (diff < -max_delta)
+        diff = -max_delta;
 
-    if (raw_target_pos > prev_leg_pos_cmd + max_delta)
-        raw_target_pos = prev_leg_pos_cmd + max_delta;
-    else if (raw_target_pos < prev_leg_pos_cmd - max_delta)
-        raw_target_pos = prev_leg_pos_cmd - max_delta;
-
-    prev_leg_pos_cmd = raw_target_pos;
-    final_leg_pos    = raw_target_pos;
+    float new_cmd    = wrap180(prev + diff);
+    prev_leg_pos_cmd = new_cmd;
+    final_leg_pos    = new_cmd;
 
     final_leg_vel   = target_leg_vel + leg_compensation_vel;
     final_leg_force = target_leg_force + leg_compensation_force;
@@ -463,31 +455,31 @@ void Wheel_Leg::Set_Wheel_Leg(Wheel_Leg_Params cmd)
 {
     if (cmd.state == Chassis_State::IDLE)
     {
-        // Safe hold-in-place on IDLE / disconnect:
-        //   - Wheel target 0 (deadzone in Execute_Wheel_Control disables torque
-        //     once it stops, so wheels coast to a stop with light Kd damping).
-        //   - Leg target = CURRENT position (not 0!) so the motor doesn't try
-        //     to drive back to 0° with whatever Kp it had last cycle.
-        //   - Kp/Kd low but non-zero so gravity doesn't drop the leg.
-        //     Free-wheel (Kp=0 Kd=0) caused legs to flop and then slam back
-        //     when the mode resumed.
+        // Safe IDLE / disconnect hold:
+        //   - Wheel target 0 (Execute_Wheel_Control deadzone kills torque once
+        //     stopped; light Kd damping coasts wheels to a smooth stop).
+        //   - Legs: PURE DAMPING (Kp = 0, Kd > 0).
+        //       • No position hold ⇒ user can freely reposition the leg by hand
+        //         (calibration, repair, manual move) without fighting the motor.
+        //       • Avoids the ±π boundary fight: with Kp>0, target=cur_pos
+        //         crossing ±π produces an ambiguous wrap (DM may see ~2π error)
+        //         and the leg shakes near the boundary.
+        //       • Kd alone damps gravity-driven swing, so the leg doesn't flop
+        //         freely.
+        //   - Re-entry into ES/COMFORT from IDLE is protected by the Kp ramp
+        //     in Chassis::Set_Mode, so 0 → 60 is smooth.
         cmd.Wheel_RPM = 0.0f;
-        if (leg_motor)
-        {
-            float cur_pos = Get_LegPosition();
-            cmd.Leg_POS   = cur_pos;
-            // Sync slew-rate limiter to current pos so the limiter doesn't
-            // slowly ramp from the previous mode's target (e.g. 0° in ES) up
-            // to the physical pose, which would create a large position error
-            // on the first IDLE frame and produce a torque pulse.
-            prev_leg_pos_cmd = cur_pos;
-        }
-        else
-            cmd.Leg_POS = 0.0f;
+        cmd.Leg_POS   = 0.0f;  // unused when Kp=0
         cmd.Leg_RPM   = 0.0f;
         cmd.Leg_Force = 0.0f;
-        cmd.Leg_Kp    = 8.0f;  // gentle hold
-        cmd.Leg_Kd    = 1.0f;  // damp out swing
+        cmd.Leg_Kp    = 0.0f;  // no position hold
+        cmd.Leg_Kd    = 3.0f;  // heavy damping → leg slowly settles to lowest pose under gravity
+
+        // Keep slew-rate state in sync with the physical pose so that when we
+        // leave IDLE the first ramped command starts from "where the leg is",
+        // not from a stale value.
+        if (leg_motor)
+            prev_leg_pos_cmd = Get_LegPosition();
     }
 
     // 1. Set Targets
