@@ -99,12 +99,20 @@ class Impedance_Controller
 
         // --- Virtual Impedance (Cartesian space) ---
         // Sized for human-payload (≈70 kg) operation. At θ=90°:
-        //   Kp_MIT = r²·sin²·kv = 0.0081·kv  →  kv=20000 ⇒ Kp≈162 N·m/rad
-        //   Kd_MIT = r²·sin²·cv = 0.0081·cv  →  cv=800   ⇒ Kd≈6.5 (clamped to mit_kd_max)
-        float kv_base = 20000.0f;  // Base virtual stiffness (N/m)
-        float cv_base = 1500.0f;   // Base virtual damping (N·s/m). At θ=90°: r²·cv = 12.15,
-                                   // hits the DM Kd ceiling (5) over most of the workspace,
-                                   // giving consistent near-critical damping at light load.
+        //   Kp_MIT = r²·sin²·kv = 0.0081·kv  →  kv=14000 ⇒ Kp≈113 N·m/rad
+        //   Kd_MIT = r²·sin²·cv = 0.0081·cv  →  cv=1500  ⇒ Kd≈12 (clamped to 5)
+        // Tuning history:
+        //   kv_base = 20000 (Kp≈162) → under heavy load, transient disturbances
+        //     (ground impact / wheel reaction / warp dh step) excite a brief
+        //     high-frequency limit cycle in the leg position loop (current
+        //     spike 25A→60A with ringing). DM Kd is already saturated at 5,
+        //     so we can't add more damping; the only way to recover damping
+        //     ratio ζ = Kd / (2√(Kp·J)) is to reduce Kp.
+        //   kv_base = 14000 → Kp≈113. Gravity hold comes from FFW (mass-est
+        //     × g × r × sinθ), so position loop only tracks small deviations;
+        //     a lower Kp is fine.
+        float kv_base = 14000.0f;  // Base virtual stiffness (N/m)
+        float cv_base = 1500.0f;   // Base virtual damping (N·s/m).
 
         // --- Skyhook Kd Modulation (DISABLED — accel_z noise too high) ---
         float cv_sky_gain = 0.0f;     // Disabled: accel-based velocity estimate is pure noise

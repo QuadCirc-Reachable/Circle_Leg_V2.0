@@ -54,9 +54,13 @@ class GroundContact
         //   0.0003 + ki 0.00003 → stable but warp_dh still <1mm/A, can't pull
         //     unloaded legs to ground in time.
         //   → kp=0.001, ki=0.0001. Per amp: ~2.5 mm dh, hits 20 mm at ~8 A.
+        //   0.001/0.0001 → much better but BR still slightly off ground when
+        //     FR is lifted (steady-state residual).
+        //   → boost ki 3× to nail the steady state without touching kp
+        //     (kp drives transients & stability; ki kills DC error).
         float kp          = 0.001f;   // m / A
-        float ki          = 0.0001f;  // m / (A·s)
-        float max_warp_dh = 0.030f;   // raise from 20mm to 30mm headroom
+        float ki          = 0.0003f;  // m / (A·s)
+        float max_warp_dh = 0.030f;
         float deadband    = 0.6f;
     };
 
