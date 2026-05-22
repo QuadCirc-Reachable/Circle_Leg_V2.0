@@ -86,8 +86,16 @@ float Climbing_Dynamics::computeBetaFromTheta(float theta_rad) const
 
 float Climbing_Dynamics::computeThetaEnd() const
 {
-    // θ_end = arccos((L - h) / L)
-    float arg = (cfg_.leg_length_m - cfg_.step_height_m) / cfg_.leg_length_m;
+    // The body starts at the prep pose (θ = prep_theta), so its Y coordinate is
+    //   H_prep = R + L·cos(prep_theta)
+    // After climbing one step the body has descended by exactly one step height:
+    //   H_complete = H_prep − h
+    // Inverting H = R + L·cos(θ_model) gives:
+    //   cos(θ_end) = cos(prep_theta) − h / L
+    // (Previously the formula assumed H_prep = R + L, i.e. prep_theta = 0,
+    //  which leaves a small steady-state height offset of L·(1 − cos(prep)).)
+    float prep_rad = cfg_.prep_theta_deg * PI / 180.0f;
+    float arg      = cosf(prep_rad) - cfg_.step_height_m / cfg_.leg_length_m;
     if (arg > 1.0f)
         arg = 1.0f;
     if (arg < -1.0f)
@@ -278,20 +286,20 @@ void Climbing_Dynamics::update(const LegClimbFeedback feedback[4], float dt)
         case LegClimbPhase::COMPLETE:
         {
             // Hold at the end-of-climb angle: wheel is on step, leg stays bent.
-            //   H_complete = R + L - h
-            //   cos(θ_model) = (L - h) / L
-            float L   = cfg_.leg_length_m;
-            float h   = cfg_.step_height_m;
-            float cth = (L - h) / L;
-            if (cth > 1.0f)
-                cth = 1.0f;
-            if (cth < -1.0f)
-                cth = -1.0f;
-            float theta_complete_deg = acosf(cth) * 180.0f / PI;
+            //   H_prep     = R + L·cos(prep_theta)
+            //   H_complete = H_prep − h          (body descended by one step)
+            //   cos(θ_model_complete) = cos(prep_theta) − h / L
+            //
+            // The unsigned motor angle θ_motor = 180° − θ_model is positive; the
+            // caller (Chassis) applies climb_sign[i] to pick the correct branch
+            // of the two solutions (FL/FR negative, BL/BR positive — matches the
+            // mechanical mounting of the leg motors).
+            float theta_complete_rad = computeThetaEnd();
+            float theta_complete_deg = theta_complete_rad * 180.0f / PI;
 
             target_theta_deg_[i] = 180.0f - theta_complete_deg;
             target_omega_[i]     = 0.0f;
-            target_h_[i]         = heightFromTheta(acosf(cth));
+            target_h_[i]         = heightFromTheta(theta_complete_rad);
             target_v_[i]         = 0.0f;
             // Stay in COMPLETE — caller must explicitly reset to IDLE
             break;

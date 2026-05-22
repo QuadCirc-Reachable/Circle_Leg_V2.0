@@ -10,6 +10,13 @@
 #define BTN_ML (1 << 6)
 #define BTN_MR (1 << 7)
 
+// D-Pad Bitmasks (lives in PC_Msg.dpad_status). Used to pick one of
+// 4 global speed tiers — see Controller::SpeedTier.
+#define DPAD_UP (1 << 0)
+#define DPAD_DOWN (1 << 1)
+#define DPAD_LEFT (1 << 2)
+#define DPAD_RIGHT (1 << 3)
+
 // Maximum Size 64 bytes
 namespace Protocol
 {
@@ -58,6 +65,7 @@ struct PC_Msg
     uint16_t Left_trigger_x1000_msg;   // 2 bytes (Mapped from 0.0 ~ 1.0)
     uint16_t Right_trigger_x1000_msg;  // 2 bytes (Mapped from 0.0 ~ 1.0)
     uint8_t button_status;             // 1 byte
+    uint8_t dpad_status;               // 1 byte — D-pad bitmask (DPAD_UP/DOWN/LEFT/RIGHT)
 
     void reset()
     {
@@ -68,7 +76,8 @@ struct PC_Msg
         Left_trigger_x1000_msg       = 0;
         Right_trigger_x1000_msg      = 0;
         button_status                = 0;
+        dpad_status                  = 0;
     }
 } __attribute__((packed));
-// Total: 13 bytes
+// Total: 14 bytes
 }  // namespace Protocol

@@ -10,11 +10,11 @@ namespace Applications
 using namespace Core::Drivers;
 
 // PID Parameters for Active Suspension (Comfort Mode)
-// Adjust these based on actual tuning
-// Output limit is now in METERS.
-// Max travel is 2*r = 130mm = 0.13m. Set limit to 0.15m to allow full range.
-static Core::Control::PID::Param roll_pid_param(0.015f, 0.0002f, 0.00012f, 1000.0f, 0.08f);
-static Core::Control::PID::Param pitch_pid_param(0.015f, 0.00015f, 0.00012f, 1000.0f, 0.08f);
+// 增益定义全部在 Robot_Params.hpp 的“COMFORT 调平”小节，这里只组装。
+static Core::Control::PID::Param roll_pid_param(
+    BODY_ROLL_PID_KP, BODY_ROLL_PID_KI, BODY_ROLL_PID_KD, BODY_ROLL_PID_INT_LIMIT, BODY_ROLL_PID_OUT_LIMIT);
+static Core::Control::PID::Param pitch_pid_param(
+    BODY_PITCH_PID_KP, BODY_PITCH_PID_KI, BODY_PITCH_PID_KD, BODY_PITCH_PID_INT_LIMIT, BODY_PITCH_PID_OUT_LIMIT);
 
 static Core::Control::PID roll_pid(roll_pid_param);
 static Core::Control::PID pitch_pid(pitch_pid_param);
@@ -93,6 +93,29 @@ void Chassis::Init()
 
 void Chassis::Set_Mode(Chassis_State new_state)
 {
+    // --- Intercept exit from CLIMBING: must home back to motor-frame 0°
+    //     before actually switching modes. DM motors accumulate multi-turn
+    //     position internally; switching to position-control mode while the
+    //     legs are at ±170° (PREP/COMPLETE) and accumulated turns from
+    //     velocity-mode crossings would cause the motor to unwind by full
+    //     turns on the next position command. Returning to 0° guarantees a
+    //     clean handoff regardless of accumulated turns. ---
+    if (current_state_ == Chassis_State::CLIMBING && new_state != Chassis_State::CLIMBING)
+    {
+        if (climb_stage_ != ClimbStage::HOMING_OUT)
+        {
+            Wheel_Leg *legs[4] = {FL_WheelLegs_, FR_WheelLegs_, BL_WheelLegs_, BR_WheelLegs_};
+            for (int i = 0; i < 4; i++)
+                climb_homing_start_angle_[i] = legs[i] ? legs[i]->Get_LegPosition() : 0.0f;
+            climb_homing_ticks_       = 0;
+            climb_stage_              = ClimbStage::HOMING_OUT;
+            climb_pending_exit_state_ = new_state;
+        }
+        // Stay in CLIMBING — handleClimbingMode will do the ramp and
+        // re-call Set_Mode(pending) once HOMING_OUT completes.
+        return;
+    }
+
     // --- Capture exit state when LEAVING COMFORT (for smooth Kp ramp-out) ---
     if (current_state_ == Chassis_State::COMFORT && new_state != Chassis_State::COMFORT)
     {
@@ -134,6 +157,11 @@ void Chassis::Set_Mode(Chassis_State new_state)
     if (new_state == Chassis_State::COMFORT)
     {
         impedance_.reset();  // Will start its kp ramp ONLY after homing completes
+
+        // todo3: ES → COMFORT 软启动窗口。只在「上一模式 == ES」时开窗；
+        // 其它模式进入 COMFORT 不触发，避免误伤正常切换响应。
+        if (current_state_ == Chassis_State::ENERGY_SAVING)
+            es_to_comfort_limit_ticks_ = ES2COMFORT_LIMIT_TICKS;
 
         // Capture the Kp/Kd the legs were holding under the previous mode so
         // the homing handoff doesn't release stiffness. ENERGY_SAVING uses
@@ -207,7 +235,16 @@ void Chassis::Set_Mode(Chassis_State new_state)
     if (new_state == Chassis_State::CLIMBING)
     {
         climbing_.reset();
-        climbing_.startClimbAll();
+        // DO NOT start climbing pipeline yet — first home all legs to 0°,
+        // then wait for user BTN_X to begin climbing. This guarantees the
+        // PREP angle (~±170°) is approached from 0° (single-direction
+        // sweep, never crosses ±π wrap).
+        Wheel_Leg *legs[4] = {FL_WheelLegs_, FR_WheelLegs_, BL_WheelLegs_, BR_WheelLegs_};
+        for (int i = 0; i < 4; i++)
+            climb_homing_start_angle_[i] = legs[i] ? legs[i]->Get_LegPosition() : 0.0f;
+        climb_homing_ticks_ = 0;
+        climb_stage_        = ClimbStage::HOMING_IN;
+        climb_last_buttons_ = 0;
         // Match body height to the PREP motor angle so BL/BR (IDLE) don't
         // create a pitch difference with FL/FR (PREP).
         // PREP motor angle = 180° - prep_theta_deg.  Height at that angle
@@ -228,6 +265,19 @@ void Chassis::slewTargetHeight()
     float diff      = target_height_setpoint_ - target_chassis_height_;
     float rate_up   = HEIGHT_SLEW_PER_CYCLE;
     float rate_down = HEIGHT_SLEW_PER_CYCLE * 0.5f;
+
+    // todo3: ES → COMFORT 软启动窗口。窗口在 Set_Mode 中被开（置为
+    // ES2COMFORT_LIMIT_TICKS），这里每 tick 递减一次。窗口内把上升速率压到
+    // ES2COMFORT_MAX_H_DOT 以下，让乘客感觉抬升变柔。
+    if (es_to_comfort_limit_ticks_ > 0)
+    {
+        constexpr float kCtrlHz    = 500.0f;
+        const float capped_rate_up = ES2COMFORT_MAX_H_DOT / kCtrlHz;
+        if (capped_rate_up < rate_up)
+            rate_up = capped_rate_up;
+        --es_to_comfort_limit_ticks_;
+    }
+
     float dh_target = 0.0f;
     if (diff > rate_up)
         dh_target = rate_up;
@@ -301,6 +351,11 @@ void Chassis::Update(const Protocol::PC_Msg &cmd)
     uint8_t rising_edges    = changing_edges & current_buttons;
     last_button_status_     = current_buttons;
 
+    // Global driving speed tier from D-pad. Runs BEFORE mode dispatch so it
+    // takes effect in every mode (all modes funnel vx/wz through
+    // controller_.Map_Joystick_To_Velocity which reads the tier).
+    controller_.Update_Speed_Tier(cmd.dpad_status);
+
     bool ml_pressed = (current_buttons & BTN_ML);
     bool mr_pressed = (current_buttons & BTN_MR);
 
@@ -316,12 +371,9 @@ void Chassis::Update(const Protocol::PC_Msg &cmd)
     }
 #endif
 
+    // Active state
     static const Chassis_State kAllowedStates[] = {
-        Chassis_State::IDLE,
-        Chassis_State::ENERGY_SAVING,
-        Chassis_State::COMFORT,
-        Chassis_State::DEBUG,
-    };
+        Chassis_State::IDLE, Chassis_State::ENERGY_SAVING, Chassis_State::COMFORT, Chassis_State::CLIMBING};
     constexpr int kNumAllowed = sizeof(kAllowedStates) / sizeof(kAllowedStates[0]);
 
     if (!(ml_pressed && mr_pressed))
@@ -708,38 +760,22 @@ void Chassis::executeBodyControlImpedance(const Protocol::PC_Msg &cmd)
     //
     // The impedance loop already absorbs bumps (each leg has natural ω_n ≈
     // 9 Hz at θ=90°). Body leveling should only correct STEADY tilt (e.g.
-    // weight shift, slope), NOT chase per-wheel bump transients. If PID sees
-    // raw IMU it amplifies the 5-15 Hz bump components into commanded height
-    // steps that excite the leg resonance → violent terrain shaking.
+    // weight shift, slope), NOT chase per-wheel bump transients.
     //
-    // → LPF the IMU angles to ~1 Hz before feeding to PID. PID becomes a
-    //   slow trim loop; bumps stay inside impedance's bandwidth.
+    // 拆轴 LPF：roll 摇晃带宽 > pitch（轨距短，模态频率高），
+    // 具体 α 值见 Robot_Params.hpp::BODY_LPF_ALPHA_*。
     static float roll_lpf  = 0.0f;
     static float pitch_lpf = 0.0f;
-    const float lvl_alpha  = 0.02f;  // tau ≈ 100ms @ 500Hz → ~1.6 Hz cutoff.
-                                     // Tuning history: 0.01 (slow trim OK but
-                                     // 调平 felt slow) → 0.04 (self-excited
-                                     // with scale 0.8) → 0.02 mid-ground. Well
-                                     // below leg ω_n≈9Hz so the bump-shake mode
-                                     // isn't re-excited.
-    roll_lpf  = lvl_alpha * chassis_roll_ + (1.0f - lvl_alpha) * roll_lpf;
-    pitch_lpf = lvl_alpha * chassis_pitch_ + (1.0f - lvl_alpha) * pitch_lpf;
+    roll_lpf               = BODY_LPF_ALPHA_ROLL * chassis_roll_ + (1.0f - BODY_LPF_ALPHA_ROLL) * roll_lpf;
+    pitch_lpf              = BODY_LPF_ALPHA_PITCH * chassis_pitch_ + (1.0f - BODY_LPF_ALPHA_PITCH) * pitch_lpf;
 
     float roll_h_adj  = roll_pid(0.0f, clampSym(roll_lpf, max_roll_deg_));
     float pitch_h_adj = pitch_pid(0.0f, clampSym(pitch_lpf, max_pitch_deg_));
 
-    // Halve the leveling authority in COMFORT — impedance + Kd already provide
-    // most of the disturbance rejection; the PID just trims slow tilt.
-    const float comfort_pid_scale = 0.7f;  // Tuning history: 0.5 (no step-climb
-                                           // authority) → 0.8 + 3.2Hz LPF (self-
-                                           // excited) → 0.7 + 0.8Hz LPF as the
-                                           // stability-preserving middle ground.
-                                           // Keep LPF at 0.01 (~0.8Hz) so high-
-                                           // frequency content can't enter the
-                                           // loop; just give the slow trim more
-                                           // authority.
-    roll_h_adj *= comfort_pid_scale;
-    pitch_h_adj *= comfort_pid_scale;
+    // PID 权威按轴独立标尺（参数见 BODY_PID_SCALE_*）。
+    // roll 较高 → 压左右晃；pitch 较低 → 仅做慢漂移纠偏。
+    roll_h_adj *= BODY_PID_SCALE_ROLL;
+    pitch_h_adj *= BODY_PID_SCALE_PITCH;
 
     // Gate PID differential by impedance ramp_alpha (0→1 over ~0.4s) so we
     // never command a wide pitch/roll spread while legs are still at the
@@ -750,13 +786,32 @@ void Chassis::executeBodyControlImpedance(const Protocol::PC_Msg &cmd)
     roll_h_adj *= pid_gate;
     pitch_h_adj *= pid_gate;
 
-    // 2. Gyro Feedforward (disabled — set ff_gain > 0 to re-enable after tuning)
+    // 2. Gyro Feedforward — 角速度转高度差分速度，做"软阻尼器"。
+    //    位置 PID 只对角度误差起作用，无法直接压住角速度。
+    //    参数见 Robot_Params.hpp::BODY_GYRO_*。pitch 默认关闭。
     static float filt_pitch_rate_i = 0.0f, filt_roll_rate_i = 0.0f;
-    const float alpha = 0.05f, ff_gain = 0.0f;
-    filt_pitch_rate_i = alpha * chassis_pitch_rate_ + (1.0f - alpha) * filt_pitch_rate_i;
-    filt_roll_rate_i  = alpha * chassis_roll_rate_ + (1.0f - alpha) * filt_roll_rate_i;
-    float v_pitch_ff  = (wb_m_ / 2.0f) * filt_pitch_rate_i * ff_gain;
-    float v_roll_ff   = (wt_f_m_ / 2.0f) * filt_roll_rate_i * ff_gain;
+    filt_pitch_rate_i = BODY_GYRO_LPF_ALPHA * chassis_pitch_rate_ + (1.0f - BODY_GYRO_LPF_ALPHA) * filt_pitch_rate_i;
+    filt_roll_rate_i  = BODY_GYRO_LPF_ALPHA * chassis_roll_rate_ + (1.0f - BODY_GYRO_LPF_ALPHA) * filt_roll_rate_i;
+    float v_pitch_ff  = (wb_m_ / 2.0f) * filt_pitch_rate_i * BODY_GYRO_FF_GAIN_PITCH;
+    float v_roll_ff   = (wt_f_m_ / 2.0f) * filt_roll_rate_i * BODY_GYRO_FF_GAIN_ROLL;
+
+    // 2b. 自适应负载缩放 —— 解决"空载乱晃 / 满载需要的增益不同"问题。
+    //     上面 SCALE/FF 是按 BODY_CTRL_NOMINAL_MASS_KG（满载）调出来的；
+    //     乘上 (M_est / M_nominal) 后：空载自动变软、满载维持标定。
+    //     钳到 [MIN, MAX] 防估计抖动把环开成 0 或拉飞。
+    //     仅作用于位置/速度调平输出，不动 v_chassis（垂向 FFW 与 mass 解耦）。
+    {
+        const float m_est = impedance_.getEstimatedMass();
+        float mass_scale  = m_est / BODY_CTRL_NOMINAL_MASS_KG;
+        if (mass_scale < BODY_CTRL_MASS_SCALE_MIN)
+            mass_scale = BODY_CTRL_MASS_SCALE_MIN;
+        else if (mass_scale > BODY_CTRL_MASS_SCALE_MAX)
+            mass_scale = BODY_CTRL_MASS_SCALE_MAX;
+        roll_h_adj *= mass_scale;
+        pitch_h_adj *= mass_scale;
+        v_roll_ff *= mass_scale;
+        v_pitch_ff *= mass_scale;
+    }
 
     // Vertical velocity feedforward from the (jerk-limited) height slew. All
     // four legs share the same commanded vertical rate. Without this, MIT Kd
@@ -867,6 +922,15 @@ void Chassis::handleComfortMode(const Protocol::PC_Msg &cmd)
         // Smoothstep for gentler accel/decel at endpoints
         float s = alpha * alpha * (3.0f - 2.0f * alpha);
 
+        // Sin-based gravity FFW with a guessed chassis mass keeps the static
+        // equilibrium during HOMING aligned with what RUN converges to once
+        // its FFW kicks in. Without this, kp=30+ffw=0 sags ~10° below the
+        // commanded angle → handoff produces a visible second climb stage as
+        // RUN's mass-aware FFW pushes the leg the remaining distance.
+        const float r_m              = ECCENTRIC_OFFSET_r / 1000.0f;
+        const float chassis_per_leg  = COMFORT_HOMING_CHASSIS_MASS_GUESS * 0.25f;
+        const float ffw_load_per_leg = chassis_per_leg + LEG_MASS_kg;
+
         for (int i = 0; i < 4; i++)
         {
             if (!legs[i])
@@ -875,7 +939,12 @@ void Chassis::handleComfortMode(const Protocol::PC_Msg &cmd)
             float cmd_deg    = homing_start_angle[i] + s * (target_deg - homing_start_angle[i]);
             float kp_use     = comfort_homing_kp_start_[i] + alpha * (COMFORT_HOMING_KP_END - comfort_homing_kp_start_[i]);
             float kd_use     = comfort_homing_kd_start_[i] + alpha * (COMFORT_HOMING_KD_END - comfort_homing_kd_start_[i]);
-            legs[i]->Set_Leg_Target(cmd_deg, 0.0f, 0.0f, kp_use, kd_use);
+            // Same convention as Impedance_Controller: ffw = +load·g·r·sin(θ_motor).
+            // Use the COMMANDED angle (not feedback) so FFW grows smoothly with
+            // the smoothstep angle ramp and is insensitive to sensor noise.
+            float sin_cmd    = sinf(deg2rad(cmd_deg));
+            float ffw_homing = ffw_load_per_leg * GRAVITY_g * r_m * sin_cmd;
+            legs[i]->Set_Leg_Target(cmd_deg, 0.0f, ffw_homing, kp_use, kd_use);
             legs[i]->Set_Wheel_Target(0.0f);
         }
 
@@ -892,7 +961,13 @@ void Chassis::handleComfortMode(const Protocol::PC_Msg &cmd)
             // the handoff and the legs lose damping for one cycle → twitch.
             impedance_.config().entry_kp = COMFORT_HOMING_KP_END;
             impedance_.config().entry_kd = COMFORT_HOMING_KD_END;
-            comfort_phase_               = ComfortPhase::RUN;
+            // FFW continuity: seed the mass estimator with the same value used
+            // for HOMING's FFW so the first RUN cycle's load_per_leg matches
+            // HOMING's, AND mass_warmed_=true skips the snap (which used to
+            // fire ~0.4 s into RUN as a second push). The real estimator will
+            // then drift toward the true mass via the 0.8 Hz LPF — smooth.
+            impedance_.seedMass(COMFORT_HOMING_CHASSIS_MASS_GUESS);
+            comfort_phase_ = ComfortPhase::RUN;
         }
 
         executeMotorCommands();
@@ -1032,54 +1107,48 @@ void Chassis::handleFreeControl(const Protocol::PC_Msg &cmd)
 void Chassis::handleDebugMode(const Protocol::PC_Msg &cmd)
 {
     // ------------------------------------------------------------------
-    // DEBUG: trigger-driven LOGICAL-frame target for ALL 4 legs.
-    //   RT (Right_trigger_x1000_msg / 1000)  → +theta_logical
-    //   LT (Left_trigger_x1000_msg  / 1000)  → -theta_logical
-    // Net logical target = (RT - LT) * MAX_DEBUG_RAD.
-    //
-    // Each leg's raw motor target = logical * bending_direction_ (per leg),
-    // so when bending_direction_ is correct, RT makes ALL FOUR LEGS bend in
-    // the SAME physical direction. If one leg goes the wrong way, flip its
-    // bending direction in Robot_Config.cpp.
+    // DEBUG: button-driven LOGICAL-frame angle setpoint for climbing tuning.
+    //   X → +90°    A → +120°
+    //   B → -90°    Y → -120°
+    // Setpoint LATCHES until another button is pressed. Position control
+    // (Pos_KP non-zero, vel=0). Each leg's raw motor target =
+    // logical * bending_direction_, so all 4 legs bend the same physical way.
     // ------------------------------------------------------------------
 
-    const float MAX_DEBUG_RAD = 2.8f;  // ~160°, stays clear of ±π wrap
+    static float debug_target_deg = 0.0f;  // latched logical angle (deg)
 
-    float rt = (float)cmd.Right_trigger_x1000_msg / 1000.0f;
-    float lt = (float)cmd.Left_trigger_x1000_msg / 1000.0f;
-    if (rt > 1.0f)
-        rt = 1.0f;
-    if (rt < 0.0f)
-        rt = 0.0f;
-    if (lt > 1.0f)
-        lt = 1.0f;
-    if (lt < 0.0f)
-        lt = 0.0f;
-
-    float target_logical = (rt - lt) * MAX_DEBUG_RAD;
+    uint8_t btn = cmd.button_status;
+    if (btn & BTN_X)
+        debug_target_deg = 90.0f;
+    else if (btn & BTN_A)
+        debug_target_deg = 120.0f;
+    else if (btn & BTN_B)
+        debug_target_deg = -90.0f;
+    else if (btn & BTN_Y)
+        debug_target_deg = -120.0f;
 
     Wheel_Leg *legs[4]  = {FL_WheelLegs_, BL_WheelLegs_, FR_WheelLegs_, BR_WheelLegs_};
-    float target_rad[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float target_deg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int i = 0; i < 4; i++)
     {
         if (legs[i])
-            target_rad[i] = target_logical * (float)legs[i]->Get_Bending_Direction();
+            target_deg[i] = debug_target_deg * (float)legs[i]->Get_Bending_Direction();
     }
 
-    // DM holding gains (same as ENERGY_SAVING)
+    // Position control gains (MIT mode: Pos_KP * (target - pos) + Vel_KD * (0 - vel) + ffw)
     const float kp = 80.0f;
     const float kd = 4.0f;
 
     for (int i = 0; i < 4; i++)
     {
         if (legs[i])
-            legs[i]->Set_Leg_Target(rad2deg(target_rad[i]), 0.0f, 0.0f, kp, kd);
+            legs[i]->Set_Leg_Target(target_deg[i], 0.0f, 0.0f, kp, kd);
     }
 
-    dbg_leveling.h_fl = target_rad[0];
-    dbg_leveling.h_fr = target_rad[2];
-    dbg_leveling.h_bl = target_rad[1];
-    dbg_leveling.h_br = target_rad[3];
+    dbg_leveling.h_fl = target_deg[0] * (PI / 180.0f);
+    dbg_leveling.h_fr = target_deg[2] * (PI / 180.0f);
+    dbg_leveling.h_bl = target_deg[1] * (PI / 180.0f);
+    dbg_leveling.h_br = target_deg[3] * (PI / 180.0f);
 
     // Wheel velocity control
     float wheel_rpms[4], vx = 0.0f, wz = 0.0f;
@@ -1212,6 +1281,107 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
 {
     // IMU already updated at top of Update()
 
+    // =================================================================
+    // Sub-state machine: HOMING_IN → WAIT_START → ACTIVE → HOMING_OUT
+    // HOMING_IN / HOMING_OUT and WAIT_START all hold legs near 0°. The
+    // ACTIVE branch runs the original climbing pipeline (below).
+    // =================================================================
+    Wheel_Leg *legs_top[4] = {FL_WheelLegs_, FR_WheelLegs_, BL_WheelLegs_, BR_WheelLegs_};
+
+    if (climb_stage_ == ClimbStage::HOMING_IN || climb_stage_ == ClimbStage::HOMING_OUT)
+    {
+        // Smoothstep all legs from their captured start angle → 0°.
+        // Position control (kp=80, kd=4). Wheels follow joystick so the
+        // robot can still be driven while legs ramp to/from 0°.
+        float alpha = (float)climb_homing_ticks_ / (float)CLIMB_HOMING_FRAMES;
+        if (alpha > 1.0f)
+            alpha = 1.0f;
+        float s    = alpha * alpha * (3.0f - 2.0f * alpha);
+        float kp_h = CLIMB_HOMING_KP_END;
+        float kd_h = CLIMB_HOMING_KD_END;
+        for (int i = 0; i < 4; i++)
+        {
+            if (!legs_top[i])
+                continue;
+            float cmd_deg = climb_homing_start_angle_[i] * (1.0f - s);
+            legs_top[i]->Set_Leg_Target(cmd_deg, 0.0f, 0.0f, kp_h, kd_h);
+        }
+
+        // Wheel velocity control from joystick (with wheel-side compensation).
+        // legs_top order: FL, FR, BL, BR — matches inverseKinematics output.
+        float wheel_rpms_h[4], vx_h = 0.0f, wz_h = 0.0f;
+        controller_.Map_Joystick_To_Velocity(cmd, vx_h, wz_h);
+        inverseKinematics(vx_h, 0, wz_h, wheel_rpms_h);
+        for (int i = 0; i < 4; i++)
+        {
+            if (!legs_top[i])
+                continue;
+            legs_top[i]->Set_Wheel_Target(wheel_rpms_h[i]);
+            legs_top[i]->Add_Wheel_Compensation(legs_top[i]->Wheel_Compensation());
+        }
+
+        climb_homing_ticks_++;
+        if (climb_homing_ticks_ >= CLIMB_HOMING_FRAMES)
+        {
+            if (climb_stage_ == ClimbStage::HOMING_IN)
+            {
+                climb_stage_        = ClimbStage::WAIT_START;
+                climb_last_buttons_ = cmd.button_status;
+            }
+            else  // HOMING_OUT done → perform deferred state change
+            {
+                Chassis_State target = climb_pending_exit_state_;
+                // Force current_state_ to bypass our own intercept on next call.
+                current_state_ = Chassis_State::IDLE;
+                climb_stage_   = ClimbStage::HOMING_IN;  // reset for next entry
+                Set_Mode(target);
+                return;
+            }
+        }
+
+        executeMotorCommands();
+        return;
+    }
+
+    if (climb_stage_ == ClimbStage::WAIT_START)
+    {
+        // Hold all legs at 0°, wait for BTN_X rising edge to begin climbing.
+        // Wheels follow joystick (robot stays drivable while parked at 0°).
+        float kp_h = CLIMB_HOMING_KP_END;
+        float kd_h = CLIMB_HOMING_KD_END;
+        for (int i = 0; i < 4; i++)
+        {
+            if (!legs_top[i])
+                continue;
+            legs_top[i]->Set_Leg_Target(0.0f, 0.0f, 0.0f, kp_h, kd_h);
+        }
+
+        float wheel_rpms_w[4], vx_w = 0.0f, wz_w = 0.0f;
+        controller_.Map_Joystick_To_Velocity(cmd, vx_w, wz_w);
+        inverseKinematics(vx_w, 0, wz_w, wheel_rpms_w);
+        for (int i = 0; i < 4; i++)
+        {
+            if (!legs_top[i])
+                continue;
+            legs_top[i]->Set_Wheel_Target(wheel_rpms_w[i]);
+            legs_top[i]->Add_Wheel_Compensation(legs_top[i]->Wheel_Compensation());
+        }
+
+        bool x_now  = (cmd.button_status & BTN_X);
+        bool x_prev = (climb_last_buttons_ & BTN_X);
+        if (x_now && !x_prev)
+        {
+            climbing_.startClimbAll();
+            climb_stage_ = ClimbStage::ACTIVE;
+        }
+        climb_last_buttons_ = cmd.button_status;
+
+        executeMotorCommands();
+        return;
+    }
+
+    // climb_stage_ == ACTIVE → fall through to original climbing pipeline
+
     // --- Trigger-based DIRECT ANGLE debug (verify climbing direction) ---
     // L trigger → FL/FR sweep from -(180-deadzone) toward 0° (climbing direction)
     // R trigger → BL/BR sweep from +(180-deadzone) toward 0° (climbing direction)
@@ -1221,9 +1391,10 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
     bool manual_climb  = (l_ratio_c > 0.05f || r_ratio_c > 0.05f);
     float deadzone_deg = climbing_.config().prep_theta_deg;
     float prep_angle   = 180.0f - deadzone_deg;  // e.g. 165°
-    // Sweep: ratio=0 → ±prep_angle,  ratio=1 → 0°
-    float front_angle = -prep_angle * (1.0f - l_ratio_c);  // FL/FR: negative, toward 0
-    float back_angle  = +prep_angle * (1.0f - r_ratio_c);  // BL/BR: positive, toward 0
+    // Sweep magnitude: ratio=0 → prep_angle, ratio=1 → 0°. Per-leg sign is
+    // applied below via climb_sign[] so all four legs bend the right way.
+    float l_sweep = prep_angle * (1.0f - l_ratio_c);  // FL/FR magnitude
+    float r_sweep = prep_angle * (1.0f - r_ratio_c);  // BL/BR magnitude
 
     // --- Smooth Kp/Kd ramp when transitioning from COMFORT ---
     float climb_target_kp = 12.0f;
@@ -1342,13 +1513,17 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
 
     // Per-leg height: trigger angle debug OR climbing state machine
     float h_targets[4], v_targets[4];
-    float lev_signs[4][2]   = {{1, -1}, {1, 1}, {-1, -1}, {-1, 1}};  // {pitch_sign, roll_sign}
-    float gv_signs[4][2]    = {{1, -1}, {1, 1}, {-1, -1}, {-1, 1}};  // same for gyro FF
-    float trigger_angles[4] = {front_angle, front_angle, back_angle, back_angle};
+    float lev_signs[4][2] = {{1, -1}, {1, 1}, {-1, -1}, {-1, 1}};  // {pitch_sign, roll_sign}
+    float gv_signs[4][2]  = {{1, -1}, {1, 1}, {-1, -1}, {-1, 1}};  // same for gyro FF
+    // Per-leg trigger sweep magnitude (sign applied below via climb_sign[]).
+    float trigger_mag[4] = {l_sweep, l_sweep, r_sweep, r_sweep};
 
-    // Climbing angle sign: FL/FR negative, BL/BR positive.
-    // BL/BR use a mirrored trajectory so angle increases during climbing (see below).
-    float climb_sign[4] = {-1.0f, -1.0f, 1.0f, 1.0f};
+    // Climbing angle sign per leg: picks one of the two ±θ solutions of the
+    // inverse kinematics so each leg bends in the physically-correct direction.
+    //   angle_cmd = climb_sign[i] * (180 - prep_theta)
+    // Because the climbing path is pure velocity servo (Pos_KP=0), a leg can only
+    // rest at the sign its climb_sign dictates: +1 -> +θ, -1 -> -θ.
+    float climb_sign[4] = {1.0f, -1.0f, 1.0f, 1.0f};
 
     for (int i = 0; i < 4; i++)
     {
@@ -1402,25 +1577,35 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
         if (manual_climb)
         {
             // --- Trigger debug: direct angle command, verify climbing direction ---
-            float ffw = legs[i]->Get_LegGravityTorque();
-            legs[i]->Set_Leg_Target(trigger_angles[i], 0.0f, ffw, kp_use, kd_use);
-            dbg_angle_cmd[i] = trigger_angles[i];
+            // climb_sign[i] picks the physically-correct ±θ branch per leg.
+            float angle_cmd_dbg = climb_sign[i] * trigger_mag[i];
+            float ffw           = legs[i]->Get_LegGravityTorque();
+            legs[i]->Set_Leg_Target(angle_cmd_dbg, 0.0f, ffw, kp_use, kd_use);
+            dbg_angle_cmd[i] = angle_cmd_dbg;
         }
         else if (climbing_.isDirectControl(i))
         {
-            // --- Direct angle control for climbing phases ---
-            // Climbing_Dynamics outputs unsigned motor angle (180°=highest, 0°=lowest)
-            // and angular velocity. theta_unsigned DECREASES during climbing (165→57.4).
+            // --- Velocity-tracking control for climbing phases ---
+            // Climbing_Dynamics gives us:
+            //   theta_unsigned: per-tick trajectory target (180°=highest, 0°=lowest)
+            //   omega_unsigned: trajectory angular velocity feed-forward (rad/s)
             //
-            // FL/FR (i<2): angle = -theta_unsigned → -165 → -57.4 (toward 0) ✓
-            // BL/BR (i≥2): angle = +theta_unsigned → +165 → +57.4 (toward 0) ✓
-            //   Both front and back are mirrors, converging toward 0°.
+            // We used to send the (signed) target angle as a position command with
+            // the motor running Pos_KP closed-loop. Because the MIT frame wraps
+            // position into [-π, π], a target that crosses the ±180° boundary —
+            // e.g. when the leg starts on the opposite wrap side from the command —
+            // makes the DM solver pick the long way round and the motor spins a
+            // full turn before settling. The mitigation: keep the *target angle*
+            // for visibility but actually drive the motor with a velocity command
+            // computed from the shortest-path error to that target. Pos_KP is set
+            // to 0 so the motor's internal position loop can't introduce the wrap
+            // bug; the angular velocity loop (Vel_KD) does the work.
             float theta_unsigned = climbing_.getTargetThetaDeg(i);
-            float omega_unsigned = climbing_.getTargetOmega(i);  // negative (theta decreasing)
+            float omega_unsigned = climbing_.getTargetOmega(i);  // rad/s, negative when θ decreasing
 
-            // climb_sign: FL/FR = -1, BL/BR = +1
-            float angle_cmd = climb_sign[i] * theta_unsigned;
-            float vel_cmd   = climb_sign[i] * omega_unsigned;
+            // climb_sign: FL/FR = -1, BL/BR = +1. Both mirrors converge toward 0°.
+            float angle_cmd     = climb_sign[i] * theta_unsigned;
+            float ffw_omega_rad = climb_sign[i] * omega_unsigned;  // trajectory feed-forward (rad/s)
 
             // Pitch leveling for direct-control legs (PREP/DETECT/CLIMBING/COMPLETE).
             // The height pipeline can't reach them, so convert PID output (meters)
@@ -1445,8 +1630,30 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
                 angle_cmd = climb_sign[i] * new_theta;
             }
 
+            // Shortest-path angular error in (-180°, +180°] — kills the wraparound bug.
+            float cur_deg = legs[i]->Get_LegPosition();
+            float err_deg = angle_cmd - cur_deg;
+            while (err_deg > 180.0f)
+                err_deg -= 360.0f;
+            while (err_deg <= -180.0f)
+                err_deg += 360.0f;
+            float err_rad = err_deg * (3.14159265f / 180.0f);
+
+            // P-controller (position-error → velocity) + trajectory feed-forward.
+            const float kp_vel    = climbing_.config().climb_pos_kp_vel;
+            const float omega_lim = climbing_.config().climb_omega_max;
+            float vel_cmd_rad     = kp_vel * err_rad + ffw_omega_rad;
+            if (vel_cmd_rad > omega_lim)
+                vel_cmd_rad = omega_lim;
+            if (vel_cmd_rad < -omega_lim)
+                vel_cmd_rad = -omega_lim;
+
+            // Velocity-only MIT: Pos_KP = 0 so the motor ignores the position target
+            // (no more ±π long-way-around). The Pos_KP-zero path means we don't care
+            // what position we hand to Set_Leg_Target; send current position so any
+            // ramp / slew limiter inside Wheel_Leg stays in sync with reality.
             float ffw = legs[i]->Get_LegGravityTorque();
-            legs[i]->Set_Leg_Target(angle_cmd, vel_cmd, ffw, kp_use, kd_use);
+            legs[i]->Set_Leg_Target(cur_deg, vel_cmd_rad, ffw, 0.0f, kd_use);
             dbg_angle_cmd[i] = angle_cmd;
         }
         else

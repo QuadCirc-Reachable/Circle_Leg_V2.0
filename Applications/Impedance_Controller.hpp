@@ -209,6 +209,26 @@ class Impedance_Controller
     // descent) cannot collapse M_est → FFW → support → deeper drop.
     void setSettled(bool s) { external_settled_ = s; }
 
+    /**
+     * @brief Seed the chassis-mass estimate with a known/guessed value so
+     *        FFW starts at the right level immediately, with no snap when
+     *        the real estimator first fires.
+     *
+     * Use this when entering COMFORT from a pose where the leg current
+     * feedback can't be inverted (θ≈0 → sin≈0). The handoff (Chassis
+     * COMFORT-homing → RUN) calls this with a plausible chassis mass so the
+     * mass-warmed snap (~0.4 s into RUN) doesn't produce a visible second
+     * stage of chassis climb.
+     */
+    void seedMass(float M_kg)
+    {
+        if (M_kg < 0.0f)
+            M_kg = 0.0f;
+        I_filter_       = M_kg;
+        estimated_mass_ = M_kg;
+        mass_warmed_    = true;
+    }
+
    private:
     Config cfg_;
     LegOutput outputs_[4] = {};

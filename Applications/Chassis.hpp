@@ -201,6 +201,12 @@ class Chassis
     float height_slew_rate_                      = 0.0f;     // m/s; current slew speed (signed), used as Kd feedforward for legs
     static constexpr float HEIGHT_SLEW_PER_CYCLE = 0.0004f;  // 0.0004 m/cycle × 500 Hz = 0.2 m/s ramp
 
+    // todo3: ES → COMFORT 软启动窗口。Set_Mode 在 ES → COMFORT 切换瞬间把
+    // 这个计数器置为 ES2COMFORT_LIMIT_TICKS（窗口长度），slewTargetHeight
+    // 在每个 tick 内消费（递减）一次；窗口内上升速率被压低到
+    // ES2COMFORT_MAX_H_DOT 以下，窗口外恢复正常 HEIGHT_SLEW_PER_CYCLE。
+    int es_to_comfort_limit_ticks_ = 0;
+
     // Ground Contact Warp Compensator (COMFORT / CLIMBING modes)
     GroundContact ground_contact_;
 
@@ -245,6 +251,25 @@ class Chassis
     static constexpr float COMFORT_HOMING_THETA  = 90.0f;  // deg — middle of workspace (sin²=1)
     static constexpr float COMFORT_HOMING_KP_END = 30.0f;  // Final Kp at end of homing
     static constexpr float COMFORT_HOMING_KD_END = 2.0f;
+    // Sin-based gravity-FFW during HOMING uses this chassis mass guess so the
+    // static equilibrium during HOMING matches the equilibrium RUN converges
+    // to after impedance ramps in. Without it, sag during HOMING (FFW=0,
+    // Kp=30) is ~10° → leg lands at 81° instead of 90°, then RUN's FFW pushes
+    // the leg the remaining 9° → visible "second-stage" climb. The same value
+    // is also seeded into Impedance_Controller::seedMass at handoff to skip
+    // the mass-warmed snap.
+    //
+    // Semantics match Impedance_Controller's M: SPRUNG mass only (total robot
+    // minus the four legs, which are unsprung at the wheel end). Derive from
+    // Robot_Params so this tracks edits to ROBOT_MASS_kg / LEG_MASS_kg
+    // automatically. With ROBOT_MASS=39, LEG_MASS=4, RIDER=50 → 73 kg.
+    //
+    // Includes the expected RIDER_MASS_kg because the dominant use case is
+    // ridden — guessing the loaded value avoids ~6–7° sag at HOMING when a
+    // rider is on. Running empty causes mild overshoot (~2°) that the on-line
+    // estimator corrects within ~1 s of entering RUN; either way the visible
+    // second-stage motion is gone.
+    static constexpr float COMFORT_HOMING_CHASSIS_MASS_GUESS = (ROBOT_MASS_kg - 4.0f * LEG_MASS_kg) + RIDER_MASS_kg;
 
     // ---- ENERGY_SAVING internal sub-state machine ----
     // HOMING: drive each leg from whatever pose the previous mode left it in
@@ -269,6 +294,36 @@ class Chassis
     static constexpr int ENERGY_HOMING_FRAMES   = 400;  // 0.8s @500Hz — slow & smooth
     static constexpr float ENERGY_HOMING_KP_END = 80.0f;
     static constexpr float ENERGY_HOMING_KD_END = 4.0f;
+
+    // ---- CLIMBING internal sub-state machine ----
+    // Wraps the leg-level Climbing_Dynamics state machine with two zero-pose
+    // stages so leg motors NEVER need to cross the ±π wrap boundary during
+    // mode entry/exit (DM motors accumulate multi-turn internally even with
+    // P_MAX=π, so position-control commands across the wrap would unwind
+    // accumulated turns on the next mode switch — see Chassis.cpp notes).
+    //
+    // HOMING_IN  : smoothstep all legs from entry angle → motor-frame 0°.
+    //              No climbing logic active. Wait at 0° for user to start.
+    // WAIT_START : hold all legs at 0°. Press X to enter ACTIVE.
+    // ACTIVE     : normal climbing pipeline (PREP/DETECT/CLIMBING/COMPLETE).
+    // HOMING_OUT : user pressed a mode-switch button OR finished climb;
+    //              smoothstep legs from current angle → 0° before performing
+    //              the actual Chassis_State transition.
+    enum class ClimbStage : uint8_t
+    {
+        HOMING_IN  = 0,
+        WAIT_START = 1,
+        ACTIVE     = 2,
+        HOMING_OUT = 3
+    };
+    ClimbStage climb_stage_                    = ClimbStage::HOMING_IN;
+    int climb_homing_ticks_                    = 0;
+    float climb_homing_start_angle_[4]         = {0.0f, 0.0f, 0.0f, 0.0f};
+    Chassis_State climb_pending_exit_state_    = Chassis_State::IDLE;
+    uint8_t climb_last_buttons_                = 0;
+    static constexpr int CLIMB_HOMING_FRAMES   = 400;  // same as ENERGY_HOMING_FRAMES
+    static constexpr float CLIMB_HOMING_KP_END = 80.0f;
+    static constexpr float CLIMB_HOMING_KD_END = 4.0f;
 
    public:
     Chassis() = delete;

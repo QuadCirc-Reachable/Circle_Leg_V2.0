@@ -85,6 +85,14 @@ class Climbing_Dynamics
 
         // --- Safety ---
         float max_target_v = 0.5f;  // Max velocity feedforward magnitude (m/s)
+
+        // --- Velocity-mode tracking (used by Chassis to drive the leg) ---
+        // During climbing/prep/complete the leg angle target is converted to a
+        // velocity command via shortest-path error so the motor never tries to
+        // "unwind" across the ±π MIT boundary. The motor runs with Pos_KP=0;
+        // only Vel_KD + feed-forward angular velocity hold the trajectory.
+        float climb_pos_kp_vel = 8.0f;  // rad/s of velocity command per rad of position error
+        float climb_omega_max  = 6.0f;  // hard clamp on commanded motor speed (rad/s)
     };
 
     Climbing_Dynamics() = default;
