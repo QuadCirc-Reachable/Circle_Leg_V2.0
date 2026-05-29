@@ -28,6 +28,7 @@ void Climbing_Dynamics::startClimb(int idx)
     legs_[idx].phase          = LegClimbPhase::PREP;
     legs_[idx].beta           = 0.0f;
     legs_[idx].detect_timer_s = 0.0f;
+    legs_[idx].prep_ramp_t    = 0.0f;  // reset shared lift-ramp clock
 }
 
 void Climbing_Dynamics::startClimbDirect(int idx, float current_unsigned_deg)
@@ -45,10 +46,17 @@ void Climbing_Dynamics::startClimbDirect(int idx, float current_unsigned_deg)
 
 void Climbing_Dynamics::startClimbAll()
 {
-    // Front-first: only start FL(0)/FR(1).
-    // BL(2)/BR(3) auto-start when both front legs reach COMPLETE.
+    // All four legs PREP together so they share the synchronized lift ramp
+    // (see prep_ramp_s) -- otherwise BL/BR fall back to the normal Set_Leg_Height
+    // pipeline (slewed at 0.2 m/s) and would rise much faster than FL/FR's
+    // 1.5 s ramp, tilting the chassis. After PREP each leg transitions to DETECT
+    // and waits there for its own wheel's step-contact torque spike before
+    // proceeding to CLIMBING -- so the front-first climbing sequence is still
+    // enforced naturally by physics (back wheels are not on the step yet).
     startClimb(0);
     startClimb(1);
+    startClimb(2);
+    startClimb(3);
 }
 
 bool Climbing_Dynamics::isDirectControl(int idx) const
@@ -148,10 +156,49 @@ void Climbing_Dynamics::update(const LegClimbFeedback feedback[4], float dt)
     float prep_rad  = cfg_.prep_theta_deg * PI / 180.0f;
     float h_prep    = heightFromTheta(prep_rad);
 
+    // A4ac: Detect FL/FR BOTH-COMPLETE transition to start back-leg
+    // settle window. The chassis is in motion throughout the entire
+    // FL/FR CLIMBING phase (beta advancing, chassis moving forward and
+    // up via the trajectory) -- back legs see varying load and dynamic
+    // torque transients during that whole window. So only arm BL/BR
+    // detection after FL/FR are fully at rest in COMPLETE phase.
+    //
+    // Previously (A4yy): armed on first FL/FR -> CLIMBING. That gave
+    // a 1 s window inside an active ~2.5 s climbing dynamic, which was
+    // insufficient -- false triggers persisted.
+    bool both_front_complete_now = (legs_[0].phase == LegClimbPhase::COMPLETE &&
+                                    legs_[1].phase == LegClimbPhase::COMPLETE);
+    if (!front_was_complete_ && both_front_complete_now)
+    {
+        // Just-now both-complete transition: arm the delay window.
+        back_settle_remaining_s_ = cfg_.back_settle_s;
+        // Snap-reset BL/BR baseline so the LPF starts tracking the new
+        // (post-climb-settle) operating point cleanly rather than slowly
+        // catching up to a load-shift that accumulated during FL/FR climb.
+        legs_[2].torque_baseline   = feedback[2].leg_torque_residual;
+        legs_[3].torque_baseline   = feedback[3].leg_torque_residual;
+        legs_[2].baseline_warmup_s = 0.0f;  // re-arm fast LPF for re-convergence
+        legs_[3].baseline_warmup_s = 0.0f;
+        legs_[2].detect_timer_s    = 0.0f;  // clear any partial confirm timer
+        legs_[3].detect_timer_s    = 0.0f;
+    }
+    front_was_complete_ = both_front_complete_now;
+    if (back_settle_remaining_s_ > 0.0f)
+    {
+        back_settle_remaining_s_ -= dt;
+        if (back_settle_remaining_s_ < 0.0f)
+            back_settle_remaining_s_ = 0.0f;
+    }
+
     for (int i = 0; i < 4; i++)
     {
         LegState &leg              = legs_[i];
         const LegClimbFeedback &fb = feedback[i];
+
+        // Default: no climb-driven chassis motion. Only the CLIMBING case below
+        // overrides this with the current ramped phi_w. Chassis reads this via
+        // getEffectivePhiW() to cap wheel-motor speed during active climbing.
+        leg.climb_phi_w_current = 0.0f;
 
         switch (leg.phase)
         {
@@ -166,24 +213,45 @@ void Climbing_Dynamics::update(const LegClimbFeedback feedback[4], float dt)
         // ---------------------------------------------------------
         case LegClimbPhase::PREP:
         {
-            // Command leg to prep angle (near-extended) to avoid singularity
-            target_h_[i]         = h_prep;
-            target_v_[i]         = 0.0f;
-            target_theta_deg_[i] = 180.0f - cfg_.prep_theta_deg;  // e.g. 165°
-            target_omega_[i]     = 0.0f;
+            // Synchronized lift ramp: target_theta_deg smoothsteps from 0 to
+            // (180 - prep_theta_deg) over prep_ramp_s. ALL legs share dt and
+            // start prep_ramp_t at 0 in startClimb -> they lift in lockstep,
+            // so per-leg friction/load differences can't make one side fast
+            // and another slow (which was tilting the chassis).
+            leg.prep_ramp_t += dt;
+            float alpha = leg.prep_ramp_t / cfg_.prep_ramp_s;
+            if (alpha > 1.0f)
+                alpha = 1.0f;
+            float s              = alpha * alpha * (3.0f - 2.0f * alpha);  // smoothstep
+            float prep_angle_deg = 180.0f - cfg_.prep_theta_deg;
+            target_theta_deg_[i] = s * prep_angle_deg;
+            // FFW omega = d(target)/dt = ds/dalpha * (prep_angle/prep_ramp_s), in rad/s.
+            // ds/dalpha for smoothstep is 6*alpha*(1-alpha); zero at both ends so
+            // accel/decel are gentle.
+            if (alpha >= 1.0f)
+            {
+                target_omega_[i] = 0.0f;
+            }
+            else
+            {
+                float ds_dalpha  = 6.0f * alpha * (1.0f - alpha);
+                target_omega_[i] = ds_dalpha * prep_angle_deg * (PI / 180.0f) / cfg_.prep_ramp_s;
+            }
+            target_h_[i] = heightFromTheta(target_theta_deg_[i] * PI / 180.0f);
+            target_v_[i] = 0.0f;
 
             // Warm up torque baseline during PREP so it's stable for DETECT
             leg.torque_baseline = cfg_.baseline_alpha * fb.leg_torque_residual + (1.0f - cfg_.baseline_alpha) * leg.torque_baseline;
 
-            // Check if leg has reached prep angle (within tolerance)
-            // Motor angle for prep = 180° - prep_theta_deg (e.g. 165° for 15° deadzone)
+            // Transition to DETECT only after the ramp has finished AND the leg
+            // is at the prep angle (within tolerance). Without the ramp-complete
+            // guard the leg could enter DETECT while still moving.
             float current_theta    = fabsf(fb.leg_pos_deg);
-            float prep_motor_angle = 180.0f - cfg_.prep_theta_deg;
-            if (fabsf(current_theta - prep_motor_angle) < cfg_.prep_tolerance_deg)
+            float prep_motor_angle = prep_angle_deg;
+            if (alpha >= 1.0f && fabsf(current_theta - prep_motor_angle) < cfg_.prep_tolerance_deg)
             {
                 leg.phase          = LegClimbPhase::DETECT;
                 leg.detect_timer_s = 0.0f;
-                // Baseline is already warm from LPF above
             }
             break;
         }
@@ -193,7 +261,27 @@ void Climbing_Dynamics::update(const LegClimbFeedback feedback[4], float dt)
         {
             // Hold at detect angle while monitoring torque for step contact.
             // detect_theta_deg > 0 means we entered via startClimbDirect (skip PREP).
-            float hold_angle = (leg.detect_theta_deg > 0.0f) ? leg.detect_theta_deg : (180.0f - cfg_.prep_theta_deg);
+            float hold_angle;
+            bool is_back_for_hold = (i >= 2);
+            bool front_all_complete_for_hold = (legs_[0].phase == LegClimbPhase::COMPLETE &&
+                                                legs_[1].phase == LegClimbPhase::COMPLETE);
+            if (leg.detect_theta_deg > 0.0f)
+            {
+                hold_angle = leg.detect_theta_deg;
+            }
+            else if (is_back_for_hold && front_all_complete_for_hold)
+            {
+                // A4ab: After FL/FR COMPLETE, override BL/BR hold angle to
+                // shift CoM forward (via chassis pitch tilt). offset > 0
+                // extends; < 0 shortens (lifts wheels). Safe-range clamped.
+                hold_angle = (180.0f - cfg_.prep_theta_deg) + cfg_.back_detect_hold_offset_deg;
+                if (hold_angle > 175.0f) hold_angle = 175.0f;
+                if (hold_angle <  15.0f) hold_angle =  15.0f;
+            }
+            else
+            {
+                hold_angle = 180.0f - cfg_.prep_theta_deg;
+            }
             float hold_h     = heightFromTheta((180.0f - hold_angle) * PI / 180.0f);
 
             target_h_[i]         = hold_h;
@@ -210,9 +298,33 @@ void Climbing_Dynamics::update(const LegClimbFeedback feedback[4], float dt)
             leg.torque_baseline             = alpha_use * fb.leg_torque_residual + (1.0f - alpha_use) * leg.torque_baseline;
             leg.baseline_warmup_s += dt;
 
-            // Step detection: only after warmup
+            // FRONT-BOTH-COMPLETE GATE (A4ac, replaces A4vv's any-front-
+            // climbing gate):
+            // Back legs (BL=2, BR=3) cannot enter CLIMBING until:
+            //   1. BOTH FL and FR are in COMPLETE phase, AND
+            //   2. back_settle_remaining_s_ has counted down to 0
+            //
+            // Why stricter than A4vv: during the entire FL/FR CLIMBING phase
+            // (~2.5 s with climb_omega=0.8), the chassis is in motion via the
+            // trajectory -- back legs experience time-varying load and
+            // dynamic torque transients that easily exceed the residual
+            // threshold even with baseline LPF. Earlier "any front climbing"
+            // gate plus 1 s settle window proved insufficient. Requiring
+            // BOTH front legs at rest in COMPLETE removes the window of
+            // vulnerability entirely; back detection only proceeds when the
+            // system is genuinely static after front climb finishes.
+            bool is_back_leg = (i >= 2);
+            bool both_front_complete = (legs_[0].phase == LegClimbPhase::COMPLETE &&
+                                        legs_[1].phase == LegClimbPhase::COMPLETE);
+            bool back_settle_done    = (back_settle_remaining_s_ <= 0.0f);
+            bool front_gate_pass     = !is_back_leg || (both_front_complete && back_settle_done);
+
+            // Step detection: only after warmup AND while the leg is settled.
+            // The closed-loop drive torque during motion appears in the residual
+            // and would false-trigger CLIMBING, so require low leg speed.
             float deviation = fabsf(fb.leg_torque_residual - leg.torque_baseline);
-            if (warmed_up && deviation > cfg_.torque_res_threshold)
+            bool settled    = (fabsf(fb.leg_vel_radps) < cfg_.detect_settle_omega);
+            if (warmed_up && settled && deviation > cfg_.torque_res_threshold && front_gate_pass)
             {
                 leg.detect_timer_s += dt;
                 if (leg.detect_timer_s >= cfg_.detect_confirm_s)
@@ -223,11 +335,12 @@ void Climbing_Dynamics::update(const LegClimbFeedback feedback[4], float dt)
                     if (theta_model_rad < cfg_.theta_min_deg * PI / 180.0f)
                         theta_model_rad = cfg_.theta_min_deg * PI / 180.0f;
                     leg.beta = computeBetaFromTheta(theta_model_rad);
+                    leg.climb_ramp_t = 0.0f;  // start CLIMBING-entry smoothstep
                 }
             }
             else
             {
-                leg.detect_timer_s = 0.0f;  // Reset if spike subsides
+                leg.detect_timer_s = 0.0f;  // Reset if spike subsides OR front not ready
             }
             break;
         }
@@ -235,10 +348,17 @@ void Climbing_Dynamics::update(const LegClimbFeedback feedback[4], float dt)
         // ---------------------------------------------------------
         case LegClimbPhase::CLIMBING:
         {
-            // Integrate β at fixed rate (independent of actual wheel speed).
-            // Using actual wheel RPM fails because the wheel stalls against
-            // the step edge, giving phi_w ≈ 0 and freezing the trajectory.
-            float phi_w = cfg_.climb_omega;  // constant virtual angular velocity (rad/s)
+            // CLIMBING-entry smoothstep: phi_w starts at 0 and ramps to
+            // climb_omega over climb_ramp_s. Avoids step-on jerk that
+            // previously sent target_omega from 0 to ~5.5 rad/s in one
+            // tick at DETECT->CLIMBING transition, shaking the chassis
+            // and false-triggering BL/BR via inertial coupling.
+            leg.climb_ramp_t += dt;
+            float climb_alpha = (cfg_.climb_ramp_s > 1e-4f) ? (leg.climb_ramp_t / cfg_.climb_ramp_s) : 1.0f;
+            if (climb_alpha > 1.0f) climb_alpha = 1.0f;
+            float climb_s = climb_alpha * climb_alpha * (3.0f - 2.0f * climb_alpha);  // smoothstep [0..1]
+            float phi_w = cfg_.climb_omega * climb_s;  // effective β rate, ramps gently
+            leg.climb_phi_w_current = phi_w;  // expose to chassis for wheel-speed capping
             leg.beta += phi_w * dt;
 
             // Compute target θ from constraint:
@@ -313,20 +433,11 @@ void Climbing_Dynamics::update(const LegClimbFeedback feedback[4], float dt)
             target_v_[i] = -cfg_.max_target_v;
     }
 
-    // Front-first gating: auto-start back legs when both front legs reach COMPLETE.
-    // Skip PREP/DETECT — start CLIMBING directly from current leg angle.
-    if (legs_[0].phase == LegClimbPhase::COMPLETE && legs_[1].phase == LegClimbPhase::COMPLETE)
-    {
-        for (int i = 2; i < 4; i++)
-        {
-            if (legs_[i].phase == LegClimbPhase::IDLE)
-            {
-                // Convert signed feedback to unsigned: motor angle = |feedback|
-                float unsigned_deg = fabsf(feedback[i].leg_pos_deg);
-                startClimbDirect(i, unsigned_deg);
-            }
-        }
-    }
+    // (No front-first auto-start gate any more: all four legs were already
+    //  started in PREP by startClimbAll() so they share the lift ramp; back legs
+    //  sit in DETECT after their PREP completes and only enter CLIMBING when
+    //  their own wheel hits the step -- so the front-first sequence is still
+    //  enforced naturally, without an explicit gate.)
 }
 
 }  // namespace Applications

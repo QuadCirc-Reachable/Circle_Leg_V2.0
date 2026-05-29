@@ -81,6 +81,21 @@ class Wheel_Leg
     // Slew Rate Limiter State
     float prev_leg_pos_cmd = 0.0f;
 
+    // Continuous (unwrapped) leg-position tracking — A1 infra for the unified
+    // computed-torque control. Updated every tick in Execute_Leg_Control by
+    // accumulating the wrapped feedback delta, so it never jumps at the +/-180
+    // boundary. Lets us (a) report a multi-turn-safe position and (b) pick the
+    // nearest 360-equivalent of an absolute target so the leg never unwinds.
+    float leg_pos_continuous_   = 0.0f;    // deg, unwrapped (may exceed +/-180)
+    float prev_leg_pos_fb_      = 0.0f;    // deg, last wrapped feedback sample
+    bool  leg_cont_initialized_ = false;   // seed on first Execute_Leg_Control
+    float leg_vel_filt_         = 0.0f;    // rad/s, LPF state for torque-track damping
+
+    // TEMPORARY (FL-slow diagnosis): last Set_Leg_Torque_Track snapshot. Can be
+    // removed once FL-vs-FR speed asymmetry is root-caused.
+    float tt_omega_cmd_  = 0.0f;           // rad/s, clamped velocity setpoint
+    float tt_tau_total_  = 0.0f;           // Nm, gravity + tau_fb
+
     // Configuration
     int bending_direction_     = 1;  // 1 for Positive Angle solution, -1 for Negative Angle solution
     float wheel_coupling_sign_ = 1.0f;
@@ -114,6 +129,23 @@ class Wheel_Leg
     float Wheel_Compensation();
 
     /**
+     * @brief Feedforward wheel compensation from a COMMANDED leg angular
+     *        velocity (rad/s). Use this when the caller already has the
+     *        commanded leg omega in hand (e.g. climbing trajectory FFW or a
+     *        smoothstep derivative); it avoids the encoder-feedback lag of
+     *        the no-arg Wheel_Compensation() that reads leg_motor->getRPMFeedback().
+     *        The lag would let the wheel motor trail the leg's acceleration
+     *        during PREP startup -> ground scrub. Position factor cos(theta)
+     *        still uses the actual motor angle (true instantaneous geometry).
+     *
+     * @param leg_omega_radps Commanded leg angular velocity in motor frame
+     *                        (signed rad/s, same sign convention as the
+     *                        omega_ff passed to Set_Leg_Torque_Track).
+     * @return Compensation rpm to be added to wheel motor control.
+     */
+    float Wheel_Compensation(float leg_omega_radps);
+
+    /**
      * @brief Calculate motor torque required for a given vertical force (VMC)
      * @param F_z Vertical force in Newtons
      * @return Required motor torque in N-m
@@ -131,10 +163,36 @@ class Wheel_Leg
      */
     float Get_WheelRPM();
     /**
-     * @brief Get leg position command in degrees
-     * @return Leg position command in degrees
+     * @brief Leg angle wrapped to the single-turn range (-180, 180] degrees.
+     * This is the raw encoder angle (leg_offset removed, then normalized). It
+     * JUMPS at the +/-180 boundary, so do NOT difference it across the seam --
+     * use Get_LegAngleUnwrapped() for any control error near the top pose.
      */
-    float Get_LegPosition();
+    float Get_LegAngleWrapped();
+
+    /**
+     * @brief Continuous, multi-turn leg angle in degrees (NEVER wraps).
+     * Maintained in software by accumulating the per-tick wrapped-feedback
+     * delta in Execute_Leg_Control(), so it is safe to difference anywhere,
+     * including across the +/-180 seam. Use this for the unified torque control.
+     */
+    float Get_LegAngleUnwrapped() const { return leg_pos_continuous_; }
+
+    /**
+     * @brief Nearest 360-equivalent of an absolute target angle, in the
+     * continuous frame. Leg height H = R - r*cos(theta) is 360-periodic, so any
+     * theta+/-360k is the same height; returning the representative within +/-180
+     * of the current continuous position lets a caller command a pose without
+     * ever forcing a multi-turn unwind (passenger-safety critical).
+     * @param target_deg Desired absolute angle (deg, any range)
+     * @return target expressed in the continuous frame
+     */
+    float NearestEquivalentTarget(float target_deg) const;
+
+    // TEMPORARY (FL-slow diagnosis): last torque-track snapshot accessors.
+    float Get_TT_OmegaCmd() const { return tt_omega_cmd_; }
+    float Get_TT_OmegaFb()  const { return leg_vel_filt_; }
+    float Get_TT_TauTotal() const { return tt_tau_total_; }
 
     /**
      * @brief Get wheel motor raw current feedback (Amps)
@@ -306,6 +364,61 @@ class Wheel_Leg
      * @param comp_force Force compensation in N-m
      */
     void Add_Leg_Compensation(float comp_pos, float comp_vel, float comp_force);
+
+    /**
+     * @brief Unified computed-torque leg control (passenger-safe, wrap-free).
+     *
+     * Software velocity loop: continuous-frame position error -> speed-limited
+     * velocity setpoint -> torque, sent ENTIRELY as MIT FFW with Pos_KP = 0 and
+     * Vel_KD = 0. The DM never runs its internal loops, so it can never unwind
+     * multiple turns at the +/-180 seam. The error uses the unwrapped angle vs.
+     * the nearest 360-equivalent target, so the leg always takes the short way
+     * to an equal-height pose. The omega_max clamp bounds leg speed, which both
+     * protects the passenger (no slamming) and keeps the motion torque from
+     * swamping step detection. Only cost vs. the motor's internal loop is the
+     * 500 Hz software rate.
+     *
+     * @param target_deg  Desired absolute leg angle (deg). Caller applies any
+     *                    per-leg bending sign before calling.
+     * @param omega_ff    Trajectory angular-velocity feed-forward (rad/s).
+     * @param kp_pos      Position->velocity gain (1/s).
+     * @param omega_max   Hard clamp on the velocity setpoint (rad/s) -- speed limit.
+     * @param kd_vel      Velocity->torque gain (Nm.s/rad).
+     * @param tau_max     Clamp on the velocity-loop torque term (Nm), excl. ffw.
+     * @param ffw_torque  Feed-forward torque (Nm) -- gravity / load comp.
+     *                    Pass 0 to disable. Caller is responsible for sign
+     *                    (this primitive adds it as-is to the velocity-loop tau).
+     */
+    void Set_Leg_Torque_Track(float target_deg, float omega_ff, float kp_pos, float omega_max, float kd_vel, float tau_max, float ffw_torque);
+
+    /**
+     * @brief Direct PD-as-torque leg control (impedance-friendly).
+     *
+     * Computes the same control law as the motor's internal MIT loop:
+     *   tau = kp*(target_cont - theta_cont) + kd*(omega_ff - omega_fb) + ffw
+     * but in software and sends it via FFW only (Pos_KP = Vel_KD = 0), so the
+     * DM never runs its position loop and can never unwind multi-turn. Units
+     * are identical to MIT (Nm/rad, Nm.s/rad), so impedance gains drop in 1:1.
+     * NearestEquivalentTarget keeps the leg single-turn safe.
+     *
+     * Use this when you want STIFF position holding with caller-supplied Kp/Kd
+     * (COMFORT impedance, HOMING ramps). For SPEED-LIMITED trajectory tracking
+     * (CLIMBING) use Set_Leg_Torque_Track instead.
+     *
+     * @param target_deg Desired absolute leg angle (deg). Caller applies any
+     *                   per-leg bending sign.
+     * @param omega_ff   Velocity feed-forward (rad/s).
+     * @param kp         Position stiffness (Nm/rad) -- holds steady state.
+     * @param kd         Velocity damping (Nm.s/rad) -- limits speed naturally
+     *                   via the kd*(omega_ff - omega_fb) term. With tau_max
+     *                   raised to the motor's hardware ceiling, this kd*omega
+     *                   restoring term is the ONLY thing that keeps a big
+     *                   position error from snapping the leg violently, so kd
+     *                   must be tuned for the desired damping ratio.
+     * @param ffw        Feed-forward torque (Nm) -- gravity comp, warp, etc.
+     * @param tau_max    Safety clamp on the total commanded torque (Nm).
+     */
+    void Set_Leg_PD_Torque(float target_deg, float omega_ff, float kp, float kd, float ffw, float tau_max);
 
     /**
      * @brief Execute leg control loop (Stage 3 of Pipeline)

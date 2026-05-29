@@ -204,8 +204,18 @@ DM10010 ID0x03 (FR) ------------------------------------ DM10010 ID0x01 (FL)
 // OutLim 单位：米（高度差分上限）。Max travel = 2r = 0.13m，留余量取 0.08。
 #define BODY_ROLL_PID_KP 0.015f
 #define BODY_ROLL_PID_KI 0.0002f
-#define BODY_ROLL_PID_KD 0.00012f
-#define BODY_ROLL_PID_INT_LIMIT 1000.0f
+// 0.00012 -> 0.0004 (3x). Leg-side Kd 已经拉满（mit_kd_max=15），剩下能
+// 抑制 roll 振荡的是 body-PID 自身的 D 项——直接对 chassis_roll 的角速度
+// 做反馈。增大 KD 提供更快的"body 角度速度"阻尼，比 leg-Kd 经过腿动力学
+// 间接绕回来更快收敛。
+#define BODY_ROLL_PID_KD 0.0004f
+// INT_LIMIT was 1000 (huge), which let the Ki accumulator wind up over the
+// ~1 s M_est LPF settle window during empty-chassis ES->COMFORT and push the
+// roll command into saturation -> divergent left-right oscillation. 100
+// caps the integral contribution to ~0.02 m h_adj (Ki*INT_LIMIT), still
+// enough to nudge out steady-state offset, but prevents windup-driven
+// runaway when the load is misestimated.
+#define BODY_ROLL_PID_INT_LIMIT 100.0f
 #define BODY_ROLL_PID_OUT_LIMIT 0.08f
 
 #define BODY_PITCH_PID_KP 0.015f
@@ -221,13 +231,19 @@ DM10010 ID0x03 (FR) ------------------------------------ DM10010 ID0x01 (FL)
 #define BODY_LPF_ALPHA_PITCH 0.02f  // ~1.6 Hz 截止
 
 // — PID 输出标尺（COMFORT 下 PID 权威 = PID(out) × SCALE） —
-#define BODY_PID_SCALE_ROLL 1.6f   // 调参史：0.7 → 1.0 → 1.3 → 1.6（载人压屁股摇晃）
+// 调参史：0.7 → 1.0 → 1.3 → 1.6（载人压屁股摇晃）→ 1.0
+// 在 cv_base=5000、mit_kd_max=15 的"重过阻尼"腿端配置下，1.6 反而让 body PID
+// 输出和 leg 响应形成振荡（PID 推 → 腿大幅响应 → 过冲 → PID 反推 → 振荡）。
+// 降到 1.0 让 PID 输出温和一些，配合更高的 KD 提供阻尼，更稳定。
+#define BODY_PID_SCALE_ROLL 1.0f
 #define BODY_PID_SCALE_PITCH 0.7f  // 调参史：0.5 → 0.8(自激) → 0.7 稳定
 
 // — Gyro 速率前馈（角速度 → 高度差分速度命令，做"虚拟阻尼"） —
 // 推荐：起步 0.002，嫌晃逐步 +0.001 加到 0.005；pitch 默认关闭。
 #define BODY_GYRO_LPF_ALPHA 0.05f       // 角速度 LPF
-#define BODY_GYRO_FF_GAIN_ROLL 0.0035f  // 0.002 → 0.0035（载人 roll 阻尼不够）
+// 0.002 → 0.0035 → 0.007（载人 roll 仍发散，继续翻倍加 gyro damping）
+// 这是直接对 body roll 角速度的反馈，比 leg-Kd 间接路径更快收敛
+#define BODY_GYRO_FF_GAIN_ROLL 0.007f
 #define BODY_GYRO_FF_GAIN_PITCH 0.0f
 
 // — 自适应负载缩放（解决"空载乱晃 / 满载需要的增益不同"问题） —

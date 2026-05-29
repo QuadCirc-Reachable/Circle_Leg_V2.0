@@ -26,7 +26,8 @@ void Impedance_Controller::reset()
     vel_z_lpf_      = 0.0f;
     vel_z_hp_       = 0.0f;
     warp_error_     = 0.0f;
-    ramp_alpha_     = 0.0f;  // Start with entry Kp/Kd, ramp toward impedance values
+    ramp_alpha_             = 0.0f;  // Start with entry Kp/Kd, ramp toward impedance values
+    fast_lpf_remaining_s_   = cfg_.fast_lpf_duration_s;  // start a fast-LPF window on every reset
     for (int i = 0; i < 4; i++)
         outputs_[i] = {cfg_.entry_kp, cfg_.entry_kd, 0.0f};
 }
@@ -84,6 +85,16 @@ void Impedance_Controller::update(
         load_sum += leg_currents[i] / (GRAVITY * r * s_motor);
     }
 
+    // Fast-LPF window timer: counts down on every update() regardless of
+    // whether the mass estimate updates this tick (so the window is real
+    // wall-clock time after reset, not "samples accumulated").
+    if (fast_lpf_remaining_s_ > 0.0f)
+    {
+        fast_lpf_remaining_s_ -= dt;
+        if (fast_lpf_remaining_s_ < 0.0f)
+            fast_lpf_remaining_s_ = 0.0f;
+    }
+
     if (mass_update_valid)
     {
         float M_inst = load_sum - 4.0f * cfg_.leg_mass;
@@ -99,7 +110,14 @@ void Impedance_Controller::update(
         }
         else
         {
-            I_filter_ = cfg_.ffw_lpf_alpha * M_inst + (1.0f - cfg_.ffw_lpf_alpha) * I_filter_;
+            // During the early-RUN fast window use ffw_lpf_alpha_fast so the
+            // load-biased seed (loaded mass) converges to the actual measured
+            // mass in ~100-300 ms instead of ~1 s. Crucial for empty-chassis
+            // ES->COMFORT: at the slow alpha, FFW was 7x too large for ~1 s
+            // and drove divergent roll oscillation before mass_scale could
+            // catch down.
+            float alpha_use = (fast_lpf_remaining_s_ > 0.0f) ? cfg_.ffw_lpf_alpha_fast : cfg_.ffw_lpf_alpha;
+            I_filter_       = alpha_use * M_inst + (1.0f - alpha_use) * I_filter_;
         }
     }
 

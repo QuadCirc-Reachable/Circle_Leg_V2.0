@@ -57,7 +57,7 @@ void Wheel_Leg::Init()
     {
         // Wait a bit for feedback to update
         vTaskDelay(pdMS_TO_TICKS(10));
-        prev_leg_pos_cmd = Get_LegPosition();
+        prev_leg_pos_cmd = Get_LegAngleWrapped();
     }
 }
 
@@ -84,9 +84,21 @@ float Wheel_Leg::Wheel_Compensation()
     return compensation_rpm * wheel_coupling_sign_;
 }
 
+float Wheel_Leg::Wheel_Compensation(float leg_omega_radps)
+{
+    // FF variant: convert commanded leg omega (rad/s) -> rpm and apply the
+    // same geometric factor as the FB variant. cos(theta) still uses the
+    // actual motor angle so the geometric coupling is instantaneously right,
+    // only the velocity term is replaced with the lag-free commanded value.
+    float leg_rpm_ff       = leg_omega_radps * (60.0f / (2.0f * 3.14159265f));
+    float leg_pos          = Get_LegAngleWrapped();
+    float compensation_rpm = leg_rpm_ff * (1.0f + (ECCENTRIC_OFFSET_r / WHEEL_RADIUS_R) * cosf(deg2rad(leg_pos)));
+    return compensation_rpm * wheel_coupling_sign_;
+}
+
 float Wheel_Leg::VMC_Calculation(float F_z)
 {
-    float leg_pos   = Get_LegPosition();  // Degrees
+    float leg_pos   = Get_LegAngleWrapped();  // Degrees
     float theta_rad = deg2rad(leg_pos);
 
     // Jacobian: Torque = F_z * r * cos(theta)
@@ -103,11 +115,24 @@ float Wheel_Leg::Get_WheelRPM()
     return 0.0f;
 }
 
-float Wheel_Leg::Get_LegPosition()
+float Wheel_Leg::Get_LegAngleWrapped()
 {
     if (leg_motor)
         return rad2deg(normalizeAngle(leg_motor->getPositionFeedback() - leg_offset));
     return 0.0f;
+}
+
+float Wheel_Leg::NearestEquivalentTarget(float target_deg) const
+{
+    // Shift target by whole turns so it lands within +/-180 of the current
+    // continuous position -> the leg always takes the short way to an
+    // equivalent-height pose, never a multi-turn unwind.
+    float diff = target_deg - leg_pos_continuous_;
+    while (diff > 180.0f)
+        diff -= 360.0f;
+    while (diff <= -180.0f)
+        diff += 360.0f;
+    return leg_pos_continuous_ + diff;
 }
 
 float Wheel_Leg::Get_WheelCurrentFeedback()
@@ -155,7 +180,7 @@ float Wheel_Leg::Get_LegGravityTorque()
     // Gravity pushes DOWN.
     // So to hold it UP, we need Negative Torque.
 
-    float pos_deg   = Get_LegPosition();
+    float pos_deg   = Get_LegAngleWrapped();
     float theta_rad = deg2rad(pos_deg);
     float r_meter   = ECCENTRIC_OFFSET_r / 1000.0f;
 
@@ -183,7 +208,7 @@ float Wheel_Leg::Get_LegVelocity()
 Wheel_Leg_Params Wheel_Leg::Get_Info()
 {
     info.Wheel_RPM = Get_WheelRPM();
-    info.Leg_POS   = Get_LegPosition();
+    info.Leg_POS   = Get_LegAngleWrapped();
     info.Leg_Force = Get_LegForce();
     info.Leg_RPM   = Get_LegVelocity();
     return info;
@@ -226,7 +251,41 @@ void Wheel_Leg::Execute_Wheel_Control()
                                                     //   2.0 → compromise. HT8115 Kd_max=5.0.
         constexpr float RPM_TO_RADS = 2.0f * (float)M_PI / 60.0f;
 
-        const float vel_fb_rpm = wheel_motor->getRPMFeedback();
+        // Stall-detection current feedforward.
+        //
+        // Why: the loop is pure velocity-PD with Kp=0, Kd=WHEEL_KD, ffw=0.
+        // When the wheel jams against a step (rpm_fb ~= 0, rpm_cmd non-trivial)
+        // the motor only sees `Kd*omega_err` -> stall current saturates around
+        // 4 A, far below HT8115's envelope. We inject a current FFW sized to
+        // omega_err in the command direction to unlock real stall torque.
+        //
+        // Ramp blends the boost OUT as the wheel speeds up, so we don't get
+        // boost->wheel-slips-free->boost-cut->re-stall oscillation.
+        constexpr float STALL_RPM_FULL = 3.0f;   // rpm — below this: full boost
+        constexpr float STALL_RPM_OFF  = 15.0f;  // rpm — above this: no boost
+        constexpr float STALL_CMD_MIN  = 5.0f;   // rpm — only boost if we mean it
+        constexpr float STALL_FFW_GAIN = 1.2f;   // A per (rad/s) of velocity error
+        constexpr float STALL_FFW_MAX  = 12.0f;  // A, hard cap (HT8115 proto = 18 A)
+
+        const float vel_fb_rpm       = wheel_motor->getRPMFeedback();
+        const float vel_target_rad_s = final_wheel_rpm * RPM_TO_RADS;
+        const float vel_err_rad_s    = vel_target_rad_s - vel_fb_rpm * RPM_TO_RADS;
+
+        float ffw_cur = 0.0f;
+        if (fabsf(final_wheel_rpm) > STALL_CMD_MIN)
+        {
+            float ramp = (STALL_RPM_OFF - fabsf(vel_fb_rpm)) / (STALL_RPM_OFF - STALL_RPM_FULL);
+            if (ramp < 0.0f)
+                ramp = 0.0f;
+            if (ramp > 1.0f)
+                ramp = 1.0f;
+
+            ffw_cur = STALL_FFW_GAIN * vel_err_rad_s * ramp;
+            if (ffw_cur > STALL_FFW_MAX)
+                ffw_cur = STALL_FFW_MAX;
+            if (ffw_cur < -STALL_FFW_MAX)
+                ffw_cur = -STALL_FFW_MAX;
+        }
 
         if (fabsf(final_wheel_rpm) < WHEEL_RPM_DEADZONE && fabsf(vel_fb_rpm) < WHEEL_RPM_DEADZONE)
         {
@@ -235,8 +294,7 @@ void Wheel_Leg::Execute_Wheel_Control()
         }
         else
         {
-            const float vel_target_rad_s = final_wheel_rpm * RPM_TO_RADS;
-            wheel_motor->setMIT(0.0f, vel_target_rad_s, 0.0f, WHEEL_KD, 0.0f);
+            wheel_motor->setMIT(0.0f, vel_target_rad_s, 0.0f, WHEEL_KD, ffw_cur);
         }
         wheel_motor->transmit();
     }
@@ -256,6 +314,74 @@ void Wheel_Leg::Set_Leg_Target(float pos_cmd, float vel_cmd, float for_cmd, floa
     leg_compensation_pos   = 0.0f;
     leg_compensation_vel   = 0.0f;
     leg_compensation_force = 0.0f;
+}
+
+void Wheel_Leg::Set_Leg_Torque_Track(float target_deg, float omega_ff, float kp_pos, float omega_max, float kd_vel, float tau_max, float ffw_torque)
+{
+    // 1) Continuous-frame position error against the nearest 360-equivalent
+    //    target -> wrap-free, never a multi-turn unwind.
+    float target_cont = NearestEquivalentTarget(target_deg);
+    float err_rad     = deg2rad(target_cont - leg_pos_continuous_);
+
+    // 2) Position error -> velocity setpoint, hard-clamped to omega_max. This
+    //    speed limit is what keeps the leg from slamming on a large step error
+    //    (e.g. PREP from 0 to +/-170) and keeps the drive torque small enough
+    //    that it does not swamp step detection.
+    float omega_cmd = kp_pos * err_rad + omega_ff;
+    if (omega_cmd > omega_max)
+        omega_cmd = omega_max;
+    if (omega_cmd < -omega_max)
+        omega_cmd = -omega_max;
+
+    // 3) Velocity loop -> torque. Light LPF on feedback (raw motor velocity at
+    //    500 Hz is noisy and would be amplified by kd_vel).
+    constexpr float vel_alpha = 0.3f;
+    leg_vel_filt_             = vel_alpha * Get_LegVelocity() + (1.0f - vel_alpha) * leg_vel_filt_;
+    float tau_fb              = kd_vel * (omega_cmd - leg_vel_filt_);
+    if (tau_fb > tau_max)
+        tau_fb = tau_max;
+    if (tau_fb < -tau_max)
+        tau_fb = -tau_max;
+    // Caller-supplied gravity / load FFW. Climbing passes a body-mass-aware
+    // sin-based FFW (so the loaded chassis is properly compensated and front/
+    // back legs don't lag asymmetrically -> kills the pitch wobble that came
+    // from Get_LegGravityTorque()-only compensation, which counted just the
+    // 0.5 kg leg). ES passes 0 (legs at theta=0, no need).
+    float tau = ffw_torque + tau_fb;
+
+    // 4) Torque-only MIT: Pos_KP = Vel_KD = 0 so the DM never runs its internal
+    //    loops (no +/-pi unwind). Position arg kept at the current wrapped angle
+    //    so the slew-limiter state in Execute_Leg_Control stays synced (ignored
+    //    by the motor when Pos_KP = 0).
+    Set_Leg_Target(Get_LegAngleWrapped(), 0.0f, tau, 0.0f, 0.0f);
+
+    // TEMPORARY (FL-slow diagnosis): snapshot for dbg_climb_tgt.
+    tt_omega_cmd_ = omega_cmd;
+    tt_tau_total_ = tau;
+}
+
+void Wheel_Leg::Set_Leg_PD_Torque(float target_deg, float omega_ff, float kp, float kd, float ffw, float tau_max)
+{
+    // Continuous-frame position error vs. the nearest 360-equivalent target.
+    float target_cont = NearestEquivalentTarget(target_deg);
+    float err_rad     = deg2rad(target_cont - leg_pos_continuous_);
+
+    // Velocity feedback with light LPF (raw motor velocity at 500 Hz is noisy
+    // and would be amplified by stiff kd).
+    constexpr float vel_alpha = 0.3f;
+    leg_vel_filt_             = vel_alpha * Get_LegVelocity() + (1.0f - vel_alpha) * leg_vel_filt_;
+
+    // PD-as-torque + FFW. Same Kp/Kd units as MIT, no internal cascade.
+    float tau = kp * err_rad + kd * (omega_ff - leg_vel_filt_) + ffw;
+    if (tau > tau_max)
+        tau = tau_max;
+    if (tau < -tau_max)
+        tau = -tau_max;
+
+    // Torque-only MIT: Pos_KP = Vel_KD = 0 so the DM never resolves position
+    // itself (no +/-pi unwind). Position arg kept at the current wrapped angle
+    // so the slew-limiter state in Execute_Leg_Control stays synced.
+    Set_Leg_Target(Get_LegAngleWrapped(), 0.0f, tau, 0.0f, 0.0f);
 }
 
 void Wheel_Leg::Set_Leg_Height(float h_meters, float v_meters_s)
@@ -368,7 +494,20 @@ void Wheel_Leg::Set_Leg_Height(float h_meters, float v_meters_s, float kp, float
     float target_angle = theta_deg * (float)bending_direction_;
     target_vel_rad_s *= (float)bending_direction_;
 
-    Set_Leg_Target(target_angle, target_vel_rad_s, ffw_torque, kp, kd);
+    // Route through the unified software PD-torque path: gives the same Kp/Kd
+    // semantics as the old MIT loop (units are 1:1) but Pos_KP=Vel_KD=0 on the
+    // motor side, so the DM can never unwind multi-turn at the +/-pi seam.
+    // NearestEquivalentTarget inside Set_Leg_Torque keeps the leg single-turn
+    // safe across any mode transition.
+    //
+    // tau_max matches the DM hardware torque ceiling (200 Nm) so the software
+    // never restricts what the OLD motor-internal MIT loop could deliver. The
+    // first port clamped at 30 Nm and the LOADED rider hold starved: at
+    // theta=90 with M_est~80 kg, FFW alone is ~13 Nm, plus PD up to ~50 Nm on
+    // big errors -> easily 60+ Nm needed. 200 Nm is the hardware limit, not a
+    // soft target the loop ever sits at.
+    constexpr float COMFORT_TAU_MAX = 200.0f;
+    Set_Leg_PD_Torque(target_angle, target_vel_rad_s, kp, kd, ffw_torque, COMFORT_TAU_MAX);
 }
 #endif
 
@@ -394,6 +533,26 @@ void Wheel_Leg::Execute_Leg_Control()
             a += 360.0f;
         return a;
     };
+
+    // --- Continuous (unwrapped) position tracker (A1 infra) ---
+    // Accumulate the wrapped feedback delta so leg_pos_continuous_ never jumps
+    // at +/-180. Per-tick motion is far below 180 deg, so wrap180(delta) always
+    // captures the true signed step. Seeds itself on the first call. Pure state
+    // update -- does not affect the command pipeline below.
+    {
+        float fb = Get_LegAngleWrapped();
+        if (!leg_cont_initialized_)
+        {
+            leg_pos_continuous_   = fb;
+            prev_leg_pos_fb_      = fb;
+            leg_cont_initialized_ = true;
+        }
+        else
+        {
+            leg_pos_continuous_ += wrap180(fb - prev_leg_pos_fb_);
+            prev_leg_pos_fb_ = fb;
+        }
+    }
 
     float raw_target_pos = wrap180(target_leg_pos + leg_compensation_pos);
     float prev           = wrap180(prev_leg_pos_cmd);
@@ -479,7 +638,7 @@ void Wheel_Leg::Set_Wheel_Leg(Wheel_Leg_Params cmd)
         // leave IDLE the first ramped command starts from "where the leg is",
         // not from a stale value.
         if (leg_motor)
-            prev_leg_pos_cmd = Get_LegPosition();
+            prev_leg_pos_cmd = Get_LegAngleWrapped();
     }
 
     // 1. Set Targets

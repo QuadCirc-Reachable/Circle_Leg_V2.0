@@ -52,6 +52,8 @@ DbgImpedance dbg_imp;
 DbgTorque dbg_torque;
 DbgLeg dbg_leg;
 DbgWheel dbg_wheel;
+DbgClimbTarget dbg_climb_tgt __attribute__((used));
+DbgClimbPlot dbg_climb_plot __attribute__((used));
 DbgSummary dbg_summary __attribute__((used));
 volatile uint8_t dbg_state = 0;
 
@@ -91,6 +93,36 @@ void Chassis::Init()
         BR_WheelLegs_->Init();
 }
 
+float Chassis::getAdaptiveLoadPerLeg() const
+{
+    // Source priority:
+    //   1. Climbing PREP-phase mass estimator (climb_mass_estimate_kg_) once
+    //      it has finalized this session -- this is the most accurate value
+    //      for the CURRENT climb because it was measured by THIS climb's
+    //      PREP sweep, capturing whatever load (empty or with rider) is
+    //      actually on board RIGHT NOW.
+    //   2. Impedance estimator's live mass (warmed from COMFORT RUN).
+    //   3. Empty-chassis fallback if M_est too cold to trust.
+    //
+    // Why empty-chassis fallback (NOT loaded): if M_est is genuinely cold
+    // (~0, e.g. IDLE -> CLIMBING with no COMFORT visit), the PREP estimator
+    // will measure the truth within ~0.5 s of starting PREP. Using a LOADED
+    // fallback (73 kg) for that brief window means FFW would push 3x too
+    // hard on an empty chassis -> the leg overshoots target by ~12 deg ->
+    // theta_motor crosses past the +/-180 seam -> multi-turn unwind risk.
+    // Empty fallback (23 kg) errs the safe way for the leg seam; under a
+    // loaded cold-start the legs would briefly sag (~12 deg under-shoot)
+    // during the first sin-rich window, then catch up once PREP-mass
+    // estimator finalizes. No multi-turn risk.
+    if (climb_mass_estimated_)
+        return climb_mass_estimate_kg_ * 0.25f + LEG_MASS_kg;
+
+    float M_est = impedance_.getEstimatedMass();
+    if (M_est < 10.0f)
+        M_est = ROBOT_MASS_kg - 4.0f * LEG_MASS_kg;  // empty chassis ~ 23 kg
+    return M_est * 0.25f + LEG_MASS_kg;
+}
+
 void Chassis::Set_Mode(Chassis_State new_state)
 {
     // --- Intercept exit from CLIMBING: must home back to motor-frame 0°
@@ -106,7 +138,15 @@ void Chassis::Set_Mode(Chassis_State new_state)
         {
             Wheel_Leg *legs[4] = {FL_WheelLegs_, FR_WheelLegs_, BL_WheelLegs_, BR_WheelLegs_};
             for (int i = 0; i < 4; i++)
-                climb_homing_start_angle_[i] = legs[i] ? legs[i]->Get_LegPosition() : 0.0f;
+            {
+                climb_homing_start_angle_[i] = legs[i] ? legs[i]->Get_LegAngleWrapped() : 0.0f;
+                // Exit-from-CLIMBING uses Set_Leg_PD_Torque with PD gains
+                // CLIMB_HOMING_KP_END / KD_END for the whole descent. Seed
+                // the ramp start with the same values so Kp/Kd hold constant
+                // (no stiffness change) while the angle smoothsteps to 0.
+                climb_homing_kp_start_[i] = CLIMB_HOMING_KP_END;
+                climb_homing_kd_start_[i] = CLIMB_HOMING_KD_END;
+            }
             climb_homing_ticks_       = 0;
             climb_stage_              = ClimbStage::HOMING_OUT;
             climb_pending_exit_state_ = new_state;
@@ -163,15 +203,21 @@ void Chassis::Set_Mode(Chassis_State new_state)
         if (current_state_ == Chassis_State::ENERGY_SAVING)
             es_to_comfort_limit_ticks_ = ES2COMFORT_LIMIT_TICKS;
 
-        // Capture the Kp/Kd the legs were holding under the previous mode so
-        // the homing handoff doesn't release stiffness. ENERGY_SAVING uses
-        // Pos_KP=80 Kd=4.0 to nail the leg at θ=0; any sudden drop to a lower
-        // Kp releases gravity load and the chassis falls / kicks.
-        float prev_kp = 80.0f, prev_kd = 4.0f;
+        // SOFT START at COMFORT HOMING entry to prevent the transition-tick
+        // torque spike that exceeded the motor's burst limit (observed
+        // hardware "motor jitter" on ES->COMFORT). At entry the legs are at
+        // theta~0 (folded), bearing NO chassis load (the body is on the
+        // wheels). So Kp can safely start very low -- there is no support
+        // role to preserve. The ramp climbs to COMFORT_HOMING_KP_END=30 over
+        // the smoothstep, gaining stiffness as the legs reach loading angles.
+        // Even if the very first tick has a few degrees of residual err
+        // (from sensor noise or settling), Kp*err = 10 * 0.05 = 0.5 Nm is
+        // gentle -- nowhere near burst torque.
+        float prev_kp = 10.0f, prev_kd = 2.0f;
         if (current_state_ == Chassis_State::ENERGY_SAVING)
         {
-            prev_kp = 80.0f;
-            prev_kd = 4.0f;
+            prev_kp = 10.0f;
+            prev_kd = 2.0f;
         }
         else if (current_state_ == Chassis_State::IDLE)
         {
@@ -189,9 +235,9 @@ void Chassis::Set_Mode(Chassis_State new_state)
     }
     if (new_state == Chassis_State::ENERGY_SAVING)
     {
-        // Capture per-leg motor-frame angle and prior Kp/Kd so HOMING can
-        // smoothly walk every leg back to θ=0 without releasing stiffness
-        // and without firing the Wheel_Compensation FF at homing speed.
+        // Capture per-leg motor-frame angle and prior Kp/Kd so the ES descent
+        // smoothstep starts from each leg's actual entry pose -- this is what
+        // makes the transition jump-free (target = current at tick 0).
         Wheel_Leg *legs[4] = {FL_WheelLegs_, FR_WheelLegs_, BL_WheelLegs_, BR_WheelLegs_};
 
         // Decide entry Kp/Kd per source state (mirrors COMFORT homing logic).
@@ -214,7 +260,7 @@ void Chassis::Set_Mode(Chassis_State new_state)
 
         for (int i = 0; i < 4; i++)
         {
-            energy_homing_start_angle_[i] = legs[i] ? legs[i]->Get_LegPosition() : 0.0f;
+            energy_homing_start_angle_[i] = legs[i] ? legs[i]->Get_LegAngleWrapped() : 0.0f;
             if (current_state_ == Chassis_State::COMFORT)
             {
                 energy_homing_kp_start_[i] = exit_kp_[i];
@@ -239,12 +285,63 @@ void Chassis::Set_Mode(Chassis_State new_state)
         // then wait for user BTN_X to begin climbing. This guarantees the
         // PREP angle (~±170°) is approached from 0° (single-direction
         // sweep, never crosses ±π wrap).
+        //
+        // Capture per-leg entry Kp/Kd so HOMING_IN can ramp stiffness
+        // smoothly from the previous mode's gains (mirrors the ES descent
+        // style). Without this, HOMING_IN jumps from soft IDLE-hold (or
+        // COMFORT impedance) straight to kp=80 -> visible yank on entry.
         Wheel_Leg *legs[4] = {FL_WheelLegs_, FR_WheelLegs_, BL_WheelLegs_, BR_WheelLegs_};
+
+        // Decide per-leg entry Kp/Kd by source state.
+        float prev_kp_default = 0.0f, prev_kd_default = 0.5f;
+        if (current_state_ == Chassis_State::ENERGY_SAVING)
+        {
+            prev_kp_default = ENERGY_HOMING_KP_END;  // ES holds at (80, 4) -- continuous
+            prev_kd_default = ENERGY_HOMING_KD_END;
+        }
+        else if (current_state_ == Chassis_State::IDLE)
+        {
+            prev_kp_default = 0.0f;  // IDLE drops the legs to low-Kp hold
+            prev_kd_default = 0.5f;
+        }
+        else
+        {
+            // Coming from any other mode (DEBUG, FREE, etc): start near end.
+            prev_kp_default = CLIMB_HOMING_KP_END;
+            prev_kd_default = CLIMB_HOMING_KD_END;
+        }
+
         for (int i = 0; i < 4; i++)
-            climb_homing_start_angle_[i] = legs[i] ? legs[i]->Get_LegPosition() : 0.0f;
+        {
+            climb_homing_start_angle_[i] = legs[i] ? legs[i]->Get_LegAngleWrapped() : 0.0f;
+            if (current_state_ == Chassis_State::COMFORT)
+            {
+                // exit_kp_/exit_kd_ already populated above (per-leg) by the
+                // "leaving COMFORT" capture block.
+                climb_homing_kp_start_[i] = exit_kp_[i];
+                climb_homing_kd_start_[i] = exit_kd_[i];
+            }
+            else
+            {
+                climb_homing_kp_start_[i] = prev_kp_default;
+                climb_homing_kd_start_[i] = prev_kd_default;
+            }
+        }
         climb_homing_ticks_ = 0;
         climb_stage_        = ClimbStage::HOMING_IN;
         climb_last_buttons_ = 0;
+        // HOMING_IN runs its own Kp/Kd ramp; suppress the old global timer
+        // ramp inside the ACTIVE branch so they don't fight.
+        mode_transition_timer_ = 0;
+        // Reset PREP-phase mass estimator: each climb session starts a fresh
+        // measurement of "what's currently on top of the chassis".
+        for (int i = 0; i < 4; i++)
+        {
+            prep_mass_load_sum_[i] = 0.0f;
+            prep_mass_count_[i]    = 0;
+        }
+        climb_mass_estimated_   = false;
+        climb_mass_estimate_kg_ = 0.0f;
         // Match body height to the PREP motor angle so BL/BR (IDLE) don't
         // create a pitch difference with FL/FR (PREP).
         // PREP motor angle = 180° - prep_theta_deg.  Height at that angle
@@ -262,8 +359,12 @@ void Chassis::slewTargetHeight()
     // Kp_MIT → mit_kp_min floor), so impedance authority is weakest exactly
     // when we are commanding the most aggressive motion. Slow it down so the
     // legs stay close to the slewing setpoint instead of free-falling into it.
-    float diff      = target_height_setpoint_ - target_chassis_height_;
-    float rate_up   = HEIGHT_SLEW_PER_CYCLE;
+    float diff = target_height_setpoint_ - target_chassis_height_;
+    // Symmetric rate: 0.5x HEIGHT_SLEW_PER_CYCLE both ways. Full-rate up
+    // (0.2 m/s) under load caused motor stress / audible complaint per the
+    // user. Halving brings it to 0.1 m/s -- same speed as descent -- making
+    // in-COMFORT height button changes uniformly gentle.
+    float rate_up   = HEIGHT_SLEW_PER_CYCLE * 0.5f;
     float rate_down = HEIGHT_SLEW_PER_CYCLE * 0.5f;
 
     // todo3: ES → COMFORT 软启动窗口。窗口在 Set_Mode 中被开（置为
@@ -462,14 +563,32 @@ void Chassis::Update(const Protocol::PC_Msg &cmd)
     // LPF alpha for baseline (~1.6 Hz @ 500 Hz, same as Climbing_Dynamics)
     constexpr float torque_base_alpha = 0.02f;
 
-    float t_fb[4]   = {FL_WheelLegs_ ? FL_WheelLegs_->Get_LegTorqueFeedback() : 0.0f,
-                       FR_WheelLegs_ ? FR_WheelLegs_->Get_LegTorqueFeedback() : 0.0f,
-                       BL_WheelLegs_ ? BL_WheelLegs_->Get_LegTorqueFeedback() : 0.0f,
-                       BR_WheelLegs_ ? BR_WheelLegs_->Get_LegTorqueFeedback() : 0.0f};
-    float g_comp[4] = {FL_WheelLegs_ ? FL_WheelLegs_->Get_LegGravityTorque() : 0.0f,
-                       FR_WheelLegs_ ? FR_WheelLegs_->Get_LegGravityTorque() : 0.0f,
-                       BL_WheelLegs_ ? BL_WheelLegs_->Get_LegGravityTorque() : 0.0f,
-                       BR_WheelLegs_ ? BR_WheelLegs_->Get_LegGravityTorque() : 0.0f};
+    // ADAPTIVE gravity comp: uses impedance estimator's live mass so the
+    // residual is "leg_torque - expected static" rather than "leg_torque -
+    // (LEG_MASS only, cos formula)". The old `Get_LegGravityTorque()`
+    // ignored the chassis + rider (only 4 kg compensated, ~70 kg ignored)
+    // AND used a cos formula 90 deg out of phase with the actual eccentric
+    // geometry, so the residual carried a large mass + angle dependent
+    // baseline offset that the LPF had to absorb -- making detection
+    // sensitive to rider weight, pitch transitions, mass shifts. With this
+    // formula `residual ~= 0` in steady state regardless of rider weight,
+    // and any spike is direct disturbance torque.
+    const float ffw_load_per_leg_all = getAdaptiveLoadPerLeg();
+    const float r_m_all              = ECCENTRIC_OFFSET_r / 1000.0f;
+
+    Wheel_Leg *legs_all[4] = {FL_WheelLegs_, FR_WheelLegs_, BL_WheelLegs_, BR_WheelLegs_};
+    float t_fb[4]   = {0, 0, 0, 0};
+    float g_comp[4] = {0, 0, 0, 0};
+    for (int i = 0; i < 4; i++)
+    {
+        if (!legs_all[i])
+            continue;
+        t_fb[i]         = legs_all[i]->Get_LegTorqueFeedback();
+        float theta_rad = deg2rad(legs_all[i]->Get_LegAngleWrapped());
+        // Correct eccentric-leg gravity torque: tau = m * g * r * sin(theta_motor)
+        // (mass at lateral offset r*sin(theta), gravity creates motor-axis torque).
+        g_comp[i] = ffw_load_per_leg_all * GRAVITY_g * r_m_all * sinf(theta_rad);
+    }
 
     float *torque_arr[] = {&dbg_torque.torque_fl, &dbg_torque.torque_fr, &dbg_torque.torque_bl, &dbg_torque.torque_br};
     float *grav_arr[]   = {&dbg_torque.grav_fl, &dbg_torque.grav_fr, &dbg_torque.grav_bl, &dbg_torque.grav_br};
@@ -488,10 +607,10 @@ void Chassis::Update(const Protocol::PC_Msg &cmd)
     }
 
     // --- Leg angle tracking (ALL modes) ---
-    dbg_leg.fb_fl  = FL_WheelLegs_ ? FL_WheelLegs_->Get_LegPosition() : 0.0f;
-    dbg_leg.fb_fr  = FR_WheelLegs_ ? FR_WheelLegs_->Get_LegPosition() : 0.0f;
-    dbg_leg.fb_bl  = BL_WheelLegs_ ? BL_WheelLegs_->Get_LegPosition() : 0.0f;
-    dbg_leg.fb_br  = BR_WheelLegs_ ? BR_WheelLegs_->Get_LegPosition() : 0.0f;
+    dbg_leg.fb_fl  = FL_WheelLegs_ ? FL_WheelLegs_->Get_LegAngleWrapped() : 0.0f;
+    dbg_leg.fb_fr  = FR_WheelLegs_ ? FR_WheelLegs_->Get_LegAngleWrapped() : 0.0f;
+    dbg_leg.fb_bl  = BL_WheelLegs_ ? BL_WheelLegs_->Get_LegAngleWrapped() : 0.0f;
+    dbg_leg.fb_br  = BR_WheelLegs_ ? BR_WheelLegs_->Get_LegAngleWrapped() : 0.0f;
     dbg_leg.cmd_fl = FL_WheelLegs_ ? FL_WheelLegs_->Get_FinalLegCommand() : 0.0f;
     dbg_leg.cmd_fr = FR_WheelLegs_ ? FR_WheelLegs_->Get_FinalLegCommand() : 0.0f;
     dbg_leg.cmd_bl = BL_WheelLegs_ ? BL_WheelLegs_->Get_FinalLegCommand() : 0.0f;
@@ -502,12 +621,12 @@ void Chassis::Update(const Protocol::PC_Msg &cmd)
 
 void Chassis::updateDbgSummary()
 {
-    // Motor angle feedback (deg). Always fresh — Get_LegPosition reads
+    // Motor angle feedback (deg). Always fresh — Get_LegAngleWrapped reads
     // CAN feedback directly, no command pipeline needed.
-    dbg_summary.angle_fl = FL_WheelLegs_ ? FL_WheelLegs_->Get_LegPosition() : 0.0f;
-    dbg_summary.angle_fr = FR_WheelLegs_ ? FR_WheelLegs_->Get_LegPosition() : 0.0f;
-    dbg_summary.angle_bl = BL_WheelLegs_ ? BL_WheelLegs_->Get_LegPosition() : 0.0f;
-    dbg_summary.angle_br = BR_WheelLegs_ ? BR_WheelLegs_->Get_LegPosition() : 0.0f;
+    dbg_summary.angle_fl = FL_WheelLegs_ ? FL_WheelLegs_->Get_LegAngleWrapped() : 0.0f;
+    dbg_summary.angle_fr = FR_WheelLegs_ ? FR_WheelLegs_->Get_LegAngleWrapped() : 0.0f;
+    dbg_summary.angle_bl = BL_WheelLegs_ ? BL_WheelLegs_->Get_LegAngleWrapped() : 0.0f;
+    dbg_summary.angle_br = BR_WheelLegs_ ? BR_WheelLegs_->Get_LegAngleWrapped() : 0.0f;
 
     // Per-leg current height (m): H = R - r * cos(theta_motor).
     // cos is even so bending_direction sign cancels out.
@@ -777,14 +896,13 @@ void Chassis::executeBodyControlImpedance(const Protocol::PC_Msg &cmd)
     roll_h_adj *= BODY_PID_SCALE_ROLL;
     pitch_h_adj *= BODY_PID_SCALE_PITCH;
 
-    // Gate PID differential by impedance ramp_alpha (0→1 over ~0.4s) so we
-    // never command a wide pitch/roll spread while legs are still at the
-    // mode-entry pose and impedance Kp is climbing. Otherwise: entry @ θ≈0
-    // (e.g. coming from ENERGY_SAVING which holds Leg_POS=0) + immediate
-    // ±0.08m differential = legs slammed to ±70° with stiff Kp = explosion.
-    float pid_gate = impedance_.getRampAlpha();
-    roll_h_adj *= pid_gate;
-    pitch_h_adj *= pid_gate;
+    // (Was: pid_gate = impedance_.getRampAlpha() to ramp PID effect in from 0
+    //  at RUN start. After A4q, body PID is already gated by the COMFORT
+    //  HOMING smoothstep `s` and reaches FULL effect by HOLD's end. Gating it
+    //  again here from 0 would drop the PID action from full back to zero at
+    //  the HOMING -> RUN handoff and ramp it up again over ~1 s -- this is
+    //  the BIG IMPACT users felt at "switching to impedance control". Removed.
+    //  PID is now continuously at full strength across HOMING + HOLD + RUN.)
 
     // 2. Gyro Feedforward — 角速度转高度差分速度，做"软阻尼器"。
     //    位置 PID 只对角度误差起作用，无法直接压住角速度。
@@ -913,14 +1031,15 @@ void Chassis::handleComfortMode(const Protocol::PC_Msg &cmd)
         if (comfort_homing_ticks_ == 0)
         {
             for (int i = 0; i < 4; i++)
-                homing_start_angle[i] = legs[i] ? legs[i]->Get_LegPosition() : 0.0f;
+                homing_start_angle[i] = legs[i] ? legs[i]->Get_LegAngleWrapped() : 0.0f;
         }
 
         float alpha = (float)comfort_homing_ticks_ / (float)COMFORT_HOMING_FRAMES;
         if (alpha > 1.0f)
             alpha = 1.0f;
         // Smoothstep for gentler accel/decel at endpoints
-        float s = alpha * alpha * (3.0f - 2.0f * alpha);
+        float s         = alpha * alpha * (3.0f - 2.0f * alpha);
+        float ds_dalpha = 6.0f * alpha * (1.0f - alpha);  // for FF wheel comp below
 
         // Sin-based gravity FFW with a guessed chassis mass keeps the static
         // equilibrium during HOMING aligned with what RUN converges to once
@@ -931,12 +1050,55 @@ void Chassis::handleComfortMode(const Protocol::PC_Msg &cmd)
         const float chassis_per_leg  = COMFORT_HOMING_CHASSIS_MASS_GUESS * 0.25f;
         const float ffw_load_per_leg = chassis_per_leg + LEG_MASS_kg;
 
+        // --- Body PID active DURING HOMING so the chassis ends LEVEL at the
+        //     end of the lift, not tilted because of an off-centre rider load
+        //     that uniform per-leg targets cannot compensate. The "再抬一下"
+        //     feel after HOMING was the body PID kicking in at RUN start and
+        //     levelling a chassis that arrived tilted; now PID levels it
+        //     CONTINUOUSLY during the lift so RUN handoff sees a level body.
+        //     Scale PID output by s (smoothstep progress) so PID has no effect
+        //     at t=0 (legs haven't moved, no real tilt error yet) and grows
+        //     to full strength as the lift completes. The same h_adj signs
+        //     (lev_signs) and SCALE constants are used as in RUN -> a tilt
+        //     correction during HOMING is equivalent to one during RUN.
+        static float roll_lpf_homing  = 0.0f;
+        static float pitch_lpf_homing = 0.0f;
+        if (comfort_homing_ticks_ == 0)
+        {
+            // Seed LPF with current IMU angle on the first tick so it doesn't
+            // start at 0 and create a synthetic tilt error.
+            roll_lpf_homing  = chassis_roll_;
+            pitch_lpf_homing = chassis_pitch_;
+        }
+        roll_lpf_homing       = BODY_LPF_ALPHA_ROLL * chassis_roll_ + (1.0f - BODY_LPF_ALPHA_ROLL) * roll_lpf_homing;
+        pitch_lpf_homing      = BODY_LPF_ALPHA_PITCH * chassis_pitch_ + (1.0f - BODY_LPF_ALPHA_PITCH) * pitch_lpf_homing;
+        float roll_h_adj_hom  = roll_pid(0.0f, clampSym(roll_lpf_homing, max_roll_deg_)) * BODY_PID_SCALE_ROLL * s;
+        float pitch_h_adj_hom = pitch_pid(0.0f, clampSym(pitch_lpf_homing, max_pitch_deg_)) * BODY_PID_SCALE_PITCH * s;
+
+        // lev_signs: {pitch_sign, roll_sign} per leg, same as RUN's mixing.
+        const float lev_signs_hom[4][2] = {{1.0f, -1.0f}, {1.0f, 1.0f}, {-1.0f, -1.0f}, {-1.0f, 1.0f}};
+
         for (int i = 0; i < 4; i++)
         {
             if (!legs[i])
                 continue;
             float target_deg = COMFORT_HOMING_THETA * (float)legs[i]->Get_Bending_Direction();
             float cmd_deg    = homing_start_angle[i] + s * (target_deg - homing_start_angle[i]);
+            // Per-leg leveling: convert h_adj (meters) -> dtheta (deg) via
+            //   dH = r*sin(theta)*dtheta -> dtheta = dH/(r*sin(theta))
+            // Sign on theta carries through, so this works for both bending
+            // directions (positive cmd_deg -> +sin, negative -> -sin -> sign
+            // flips automatically).
+            float dh        = lev_signs_hom[i][0] * pitch_h_adj_hom + lev_signs_hom[i][1] * roll_h_adj_hom;
+            float sin_cmd_l = sinf(deg2rad(cmd_deg));
+            if (fabsf(sin_cmd_l) < 0.15f)
+                sin_cmd_l = copysignf(0.15f, sin_cmd_l);
+            float dtheta = dh / (r_m * sin_cmd_l) * (180.0f / 3.14159265f);
+            if (dtheta > 30.0f)
+                dtheta = 30.0f;
+            if (dtheta < -30.0f)
+                dtheta = -30.0f;
+            cmd_deg += dtheta;
             float kp_use     = comfort_homing_kp_start_[i] + alpha * (COMFORT_HOMING_KP_END - comfort_homing_kp_start_[i]);
             float kd_use     = comfort_homing_kd_start_[i] + alpha * (COMFORT_HOMING_KD_END - comfort_homing_kd_start_[i]);
             // Same convention as Impedance_Controller: ffw = +load·g·r·sin(θ_motor).
@@ -944,12 +1106,51 @@ void Chassis::handleComfortMode(const Protocol::PC_Msg &cmd)
             // the smoothstep angle ramp and is insensitive to sensor noise.
             float sin_cmd    = sinf(deg2rad(cmd_deg));
             float ffw_homing = ffw_load_per_leg * GRAVITY_g * r_m * sin_cmd;
-            legs[i]->Set_Leg_Target(cmd_deg, 0.0f, ffw_homing, kp_use, kd_use);
-            legs[i]->Set_Wheel_Target(0.0f);
+            // Software PD-torque (Pos_KP = Vel_KD = 0 on the motor) so the DM
+            // can never unwind multi-turn during the entry-pose ramp. tau_max
+            // matches the DM hardware ceiling -- the loaded sin-FFW (~13 Nm at
+            // theta=90) plus Kd*omega_ff during the smoothstep ramp can hit
+            // 30+ Nm peak under a rider; a low clamp here would saturate the
+            // lift and look like "legs sag during COMFORT entry".
+            constexpr float HOMING_TAU_MAX = 200.0f;
+            legs[i]->Set_Leg_PD_Torque(cmd_deg, 0.0f, kp_use, kd_use, ffw_homing, HOMING_TAU_MAX);
+        }
+
+        // Wheels: joystick velocity + FEEDFORWARD wheel compensation. The
+        // earlier "no wheel comp here" stance applied to the FB (measured
+        // leg rpm) variant -- its front/back-axle coupling could fight
+        // itself when legs had asymmetric actual rates. The FF variant
+        // takes the *commanded* leg omega (the smoothstep derivative is
+        // shared across all four legs only in magnitude scaled by each
+        // leg's start->target delta), so wheel comp directions are
+        // self-consistent. Without this the leg arm rotates by 60 deg
+        // during the lift, dragging the wheel center along an arc, but
+        // the wheel motor sees only joystick rpm -> wheel scrubs ground
+        // during the entire HOMING lift (felt as leg "fighting" the
+        // ground/wheel friction).
+        constexpr float COMFORT_HOMING_DURATION_S = COMFORT_HOMING_FRAMES * 0.002f;
+        float wheel_rpms_h[4], vx_h = 0.0f, wz_h = 0.0f;
+        controller_.Map_Joystick_To_Velocity(cmd, vx_h, wz_h);
+        inverseKinematics(vx_h, 0, wz_h, wheel_rpms_h);
+        for (int i = 0; i < 4; i++)
+        {
+            if (!legs[i])
+                continue;
+            float target_deg_w      = COMFORT_HOMING_THETA * (float)legs[i]->Get_Bending_Direction();
+            float omega_ff_rad_wcmp = (target_deg_w - homing_start_angle[i]) * ds_dalpha
+                                      * (3.14159265f / 180.0f) / COMFORT_HOMING_DURATION_S;
+            legs[i]->Set_Wheel_Target(wheel_rpms_h[i]);
+            legs[i]->Add_Wheel_Compensation(legs[i]->Wheel_Compensation(omega_ff_rad_wcmp));
         }
 
         comfort_homing_ticks_++;
-        if (comfort_homing_ticks_ >= COMFORT_HOMING_FRAMES)
+        // Transition to RUN only after BOTH the lift smoothstep (FRAMES) AND
+        // the steady-hold tail (HOLD_FRAMES) complete. While ticks are in the
+        // HOLD region, alpha clamps to 1.0 above -> s=1 -> target stays at
+        // COMFORT_HOMING_THETA, kp_use/kd_use stay at KP_END/KD_END, and ffw
+        // stays on the open-loop sin-based form. The leg fully settles at the
+        // target before impedance/body PID take over.
+        if (comfort_homing_ticks_ >= COMFORT_HOMING_FRAMES + COMFORT_HOLD_FRAMES)
         {
             // Seed target_chassis_height_ to the post-homing height so the
             // first RUN cycle commands what the legs are already at.
@@ -984,10 +1185,10 @@ void Chassis::handleComfortMode(const Protocol::PC_Msg &cmd)
                              legs[2] ? legs[2]->Get_LegCurrentFeedback() : 0.0f,
                              legs[3] ? legs[3]->Get_LegCurrentFeedback() : 0.0f};
 
-    float leg_angles[4] = {legs[0] ? legs[0]->Get_LegPosition() : 0.0f,
-                           legs[1] ? legs[1]->Get_LegPosition() : 0.0f,
-                           legs[2] ? legs[2]->Get_LegPosition() : 0.0f,
-                           legs[3] ? legs[3]->Get_LegPosition() : 0.0f};
+    float leg_angles[4] = {legs[0] ? legs[0]->Get_LegAngleWrapped() : 0.0f,
+                           legs[1] ? legs[1]->Get_LegAngleWrapped() : 0.0f,
+                           legs[2] ? legs[2]->Get_LegAngleWrapped() : 0.0f,
+                           legs[3] ? legs[3]->Get_LegAngleWrapped() : 0.0f};
 
     const float dt = 0.002f;  // 500 Hz
 
@@ -1044,59 +1245,48 @@ void Chassis::handleComfortMode(const Protocol::PC_Msg &cmd)
 
 void Chassis::handleFreeControl(const Protocol::PC_Msg &cmd)
 {
-    static float folded_angle = 180.0f;
+    // 175 deg (not 180) keeps the trigger-driven target 5 deg away from the
+    // +/-180 wrap seam, so NearestEquivalentTarget never has to resolve a
+    // boundary target (the same overshoot/wrap class of bugs we fought in
+    // CLIMBING applies here too -- mechanical rotation is 360 deg unlimited).
+    static const float folded_angle = 175.0f;
 
     // Triggers Control Angle Interpolation
-    // Left Trigger: FL & FR
-    // Right Trigger: BL & BR
-    // 0 (Released) -> folded_angle
-    // 1000 (Pressed) -> 0 deg (Extended)
+    // Left Trigger : FL/FR target  (released = -folded_angle, pressed = 0 = extended)
+    // Right Trigger: BL/BR target  (released = +folded_angle, pressed = 0 = extended)
     float l_ratio = (float)cmd.Left_trigger_x1000_msg / 1000.0f;
     float r_ratio = (float)cmd.Right_trigger_x1000_msg / 1000.0f;
 
     float fl_fr_angle = -folded_angle * (1.0f - l_ratio);
     float bl_br_angle = folded_angle * (1.0f - r_ratio);
 
-    Wheel_Leg_Params params;
-    params.state     = Chassis_State::FREE_CONTROL;
-    params.Leg_Force = 0;
-    params.Leg_RPM   = 0;
-    // Use default stiff parameters for position control
-    params.Leg_Kp = 50.0f;
-    params.Leg_Kd = 1.0f;
+    // --- Unified PD-torque legs (Pos_KP=Vel_KD=0 on motor -> no multi-turn unwind) ---
+    constexpr float FREE_KP      = 50.0f;
+    constexpr float FREE_KD      = 1.0f;
+    constexpr float FREE_TAU_MAX = 30.0f;
+    Wheel_Leg *legs[4]   = {FL_WheelLegs_, FR_WheelLegs_, BL_WheelLegs_, BR_WheelLegs_};
+    float target_deg[4]  = {fl_fr_angle, fl_fr_angle, bl_br_angle, bl_br_angle};
+    for (int i = 0; i < 4; i++)
+    {
+        if (!legs[i])
+            continue;
+        float ffw = legs[i]->Get_LegGravityTorque();
+        legs[i]->Set_Leg_PD_Torque(target_deg[i], 0.0f, FREE_KP, FREE_KD, ffw, FREE_TAU_MAX);
+    }
 
-    // Wheel control
+    // --- Wheels: joystick velocity + decoupling FF ---
     float wheel_rpms[4], vx = 0.0f, wz = 0.0f;
     controller_.Map_Joystick_To_Velocity(cmd, vx, wz);
     inverseKinematics(vx, 0, wz, wheel_rpms);
-
-    if (FL_WheelLegs_)
+    for (int i = 0; i < 4; i++)
     {
-        params.Leg_POS   = fl_fr_angle;
-        params.Wheel_RPM = wheel_rpms[0];
-        FL_WheelLegs_->Set_Wheel_Leg(params);
-    }
-    if (FR_WheelLegs_)
-    {
-        params.Leg_POS   = fl_fr_angle;
-        params.Wheel_RPM = wheel_rpms[1];
-        FR_WheelLegs_->Set_Wheel_Leg(params);
-    }
-    if (BL_WheelLegs_)
-    {
-        params.Leg_POS   = bl_br_angle;
-        params.Wheel_RPM = wheel_rpms[2];
-        BL_WheelLegs_->Set_Wheel_Leg(params);
-    }
-    if (BR_WheelLegs_)
-    {
-        params.Leg_POS   = bl_br_angle;
-        params.Wheel_RPM = wheel_rpms[3];
-        BR_WheelLegs_->Set_Wheel_Leg(params);
+        if (!legs[i])
+            continue;
+        legs[i]->Set_Wheel_Target(wheel_rpms[i]);
+        legs[i]->Add_Wheel_Compensation(legs[i]->Wheel_Compensation());
     }
 
-    // Wheel motor health (FREE_CONTROL uses Set_Wheel_Leg, not executeMotorCommands)
-    updateWheelDebug();
+    executeMotorCommands();
 }
 
 // =====================================================================
@@ -1135,14 +1325,15 @@ void Chassis::handleDebugMode(const Protocol::PC_Msg &cmd)
             target_deg[i] = debug_target_deg * (float)legs[i]->Get_Bending_Direction();
     }
 
-    // Position control gains (MIT mode: Pos_KP * (target - pos) + Vel_KD * (0 - vel) + ffw)
-    const float kp = 80.0f;
-    const float kd = 4.0f;
-
+    // Position control via software PD-torque (Pos_KP=Vel_KD=0 on motor side
+    // -> no multi-turn unwind at the +/-pi seam). Same Kp/Kd semantics as MIT.
+    constexpr float kp           = 80.0f;
+    constexpr float kd           = 4.0f;
+    constexpr float DBG_TAU_MAX  = 30.0f;
     for (int i = 0; i < 4; i++)
     {
         if (legs[i])
-            legs[i]->Set_Leg_Target(target_deg[i], 0.0f, 0.0f, kp, kd);
+            legs[i]->Set_Leg_PD_Torque(target_deg[i], 0.0f, kp, kd, 0.0f, DBG_TAU_MAX);
     }
 
     dbg_leveling.h_fl = target_deg[0] * (PI / 180.0f);
@@ -1184,94 +1375,91 @@ void Chassis::handleEnergySaving(const Protocol::PC_Msg &cmd)
 {
     Wheel_Leg *legs[4] = {FL_WheelLegs_, FR_WheelLegs_, BL_WheelLegs_, BR_WheelLegs_};
 
-    // --------- HOMING sub-state ---------
-    // Walk every leg from its entry angle to motor-frame 0° via a smoothstep
-    // trajectory; simultaneously ramp Kp/Kd from the previous mode's hold
-    // values to the ES stiffness. CRUCIAL: wheels held at 0 RPM with NO
-    // Wheel_Compensation — the decoupling FF (∝ leg_rpm) at homing speed
-    // would otherwise drive the front and back axles in opposite directions
-    // (the "rear wheels go forward / front legs flip back / car tilts then
-    // snaps level" bug). The DM slew-rate limiter inside Execute_Leg_Control
-    // still caps any cycle-to-cycle step, so this is safe even if the
-    // entry angle is large.
-    if (energy_phase_ == EnergyPhase::HOMING)
+    // === ES descent: simple smoothstep angle ramp + PD + gravity FFW ===
+    // Per user direction "简单的速度和位置闭环就好了, 如果有前馈就加前馈,
+    // 主打稳定 smooth": don't reuse the full impedance machinery (which jumped
+    // on entry because it referenced target_chassis_height_ that didn't match
+    // the leg's actual pose). Just smoothstep each leg's target angle from
+    // its captured START angle (entry pose) to 0 over a fixed duration -- the
+    // target STARTS at the current angle, so zero discontinuity on entry, no
+    // possible jump.
+    //
+    // Control law (per leg, per tick):
+    //   target_now  = start * (1 - smoothstep(t/T))                    // ramps to 0
+    //   omega_ff    = -start * d(smoothstep)/dt                        // matched velocity FFW
+    //   ffw_gravity = (M_est/4 + LEG_MASS) * g * r * sin(theta_now)     // grav comp
+    //   tau         = Kp*(target_now - cur) + Kd*(omega_ff - omega_fb) + ffw_gravity
+    // Set_Leg_PD_Torque handles the PD + FFW computation; we just compose
+    // the trajectory + ffw inputs here.
+    //
+    // Set_Mode captures energy_homing_start_angle_[i] and zeroes
+    // energy_homing_ticks_ on entry, so the handler picks up from tick 0.
+
+    float alpha = (float)energy_homing_ticks_ / (float)ENERGY_HOMING_FRAMES;
+    if (alpha > 1.0f)
+        alpha = 1.0f;
+    float s         = alpha * alpha * (3.0f - 2.0f * alpha);   // smoothstep, 0 at endpoints
+    float ds_dalpha = 6.0f * alpha * (1.0f - alpha);           // smoothstep derivative
+
+    // Stiffer position loop than the earlier 50/8. Differential turning loads
+    // the legs sideways via the eccentric wheel coupling -- under that
+    // reaction torque the previous Kp let the legs drift back-and-forth (user
+    // observed wheels "扯前后" during left/right yaw). 120 Nm/rad holds the
+    // theta=0 pose firmly through yaw transients. Kd raised to maintain the
+    // damping ratio relative to the higher Kp.
+    constexpr float ES_KP        = 120.0f;
+    constexpr float ES_KD        = 12.0f;
+    constexpr float ES_TAU_MAX   = 200.0f;
+    constexpr float ES_DURATION_S = ENERGY_HOMING_FRAMES * 0.002f;  // ticks * dt = seconds
+
+    // Gravity FFW: uniform M_est/4 per leg. M_est carries forward from the
+    // last COMFORT phase (impedance doesn't update at theta~0 due to the sin
+    // singularity gate, so it holds its last good value).
+    const float M_est        = impedance_.getEstimatedMass();
+    const float load_per_leg = M_est * 0.25f + LEG_MASS_kg;
+    const float r_m          = ECCENTRIC_OFFSET_r / 1000.0f;
+
+    for (int i = 0; i < 4; i++)
     {
-        float alpha = (float)energy_homing_ticks_ / (float)ENERGY_HOMING_FRAMES;
-        if (alpha > 1.0f)
-            alpha = 1.0f;
-        // Smoothstep: zero velocity at both endpoints → no jerk at start/end.
-        float s = alpha * alpha * (3.0f - 2.0f * alpha);
-
-        for (int i = 0; i < 4; i++)
-        {
-            if (!legs[i])
-                continue;
-            // Linear (smoothstepped) angle interpolation in motor frame
-            // toward 0. Don't multiply by bending_direction — these are
-            // already raw motor-frame angles captured in Set_Mode.
-            float cmd_deg = energy_homing_start_angle_[i] * (1.0f - s);
-            float kp_use  = energy_homing_kp_start_[i] + alpha * (ENERGY_HOMING_KP_END - energy_homing_kp_start_[i]);
-            float kd_use  = energy_homing_kd_start_[i] + alpha * (ENERGY_HOMING_KD_END - energy_homing_kd_start_[i]);
-            legs[i]->Set_Leg_Target(cmd_deg, 0.0f, 0.0f, kp_use, kd_use);
-            legs[i]->Set_Wheel_Target(0.0f);
-            // INTENTIONALLY no Add_Wheel_Compensation here.
-        }
-
-        energy_homing_ticks_++;
-        if (energy_homing_ticks_ >= ENERGY_HOMING_FRAMES)
-        {
-            energy_phase_ = EnergyPhase::RUN;
-        }
-
-        executeMotorCommands();
-        return;
+        if (!legs[i])
+            continue;
+        float start         = energy_homing_start_angle_[i];
+        float target_now    = start * (1.0f - s);              // deg, ramps start -> 0
+        // d(target)/dt = -start * ds/dalpha * (1/duration), convert deg -> rad for omega_ff
+        float omega_ff_rad  = -start * ds_dalpha * (3.14159265f / 180.0f) / ES_DURATION_S;
+        float sin_now       = sinf(deg2rad(legs[i]->Get_LegAngleWrapped()));
+        float ffw_gravity   = load_per_leg * GRAVITY_g * r_m * sin_now;
+        legs[i]->Set_Leg_PD_Torque(target_now, omega_ff_rad, ES_KP, ES_KD, ffw_gravity, ES_TAU_MAX);
     }
 
-    // --------- RUN sub-state (normal ENERGY_SAVING) ---------
-    // Legs are at θ≈0 and stationary, so Wheel_Compensation() (proportional
-    // to leg_rpm) is ~0 and Set_Wheel_Leg's internal Add_Wheel_Compensation
-    // call is harmless. Joystick now drives the wheels normally.
-    float target_kp = ENERGY_HOMING_KP_END;
-    float target_kd = ENERGY_HOMING_KD_END;
-    float kp_use    = target_kp;
-    float kd_use    = target_kd;
+    energy_homing_ticks_++;
+    if (energy_homing_ticks_ > ENERGY_HOMING_FRAMES)
+        energy_homing_ticks_ = ENERGY_HOMING_FRAMES;  // clamp so smoothstep stays at s=1 (target=0)
 
-    Wheel_Leg_Params params;
-    params.state     = Chassis_State::ENERGY_SAVING;
-    params.Leg_POS   = 0.0f;
-    params.Leg_Force = 0;
-    params.Leg_RPM   = 0;
-    params.Leg_Kp    = kp_use;
-    params.Leg_Kd    = kd_use;
-
-    // Wheel control
+    // Wheels: joystick velocity + FEEDFORWARD wheel compensation. Earlier
+    // versions intentionally skipped wheel comp here ("comp prop. to leg_rpm
+    // would drive front/back apart"); that reasoning applied to the FB
+    // (measured-rpm) variant which couples per-leg actual motion into wheel
+    // commands and can fight itself when legs have different actual rates.
+    // The FF variant takes the *commanded* leg omega per leg -- all four
+    // share the same smoothstep, so the wheel comp directions are coherent
+    // (each wheel rolls with its own leg's commanded motion). Without this
+    // the wheel center traverses an arc while the wheel motor stays at the
+    // joystick rpm -> wheel scrubs the ground during the descent.
     float wheel_rpms[4], vx = 0.0f, wz = 0.0f;
     controller_.Map_Joystick_To_Velocity(cmd, vx, wz);
     inverseKinematics(vx, 0, wz, wheel_rpms);
-
-    if (FL_WheelLegs_)
+    for (int i = 0; i < 4; i++)
     {
-        params.Wheel_RPM = wheel_rpms[0];
-        FL_WheelLegs_->Set_Wheel_Leg(params);
-    }
-    if (FR_WheelLegs_)
-    {
-        params.Wheel_RPM = wheel_rpms[1];
-        FR_WheelLegs_->Set_Wheel_Leg(params);
-    }
-    if (BL_WheelLegs_)
-    {
-        params.Wheel_RPM = wheel_rpms[2];
-        BL_WheelLegs_->Set_Wheel_Leg(params);
-    }
-    if (BR_WheelLegs_)
-    {
-        params.Wheel_RPM = wheel_rpms[3];
-        BR_WheelLegs_->Set_Wheel_Leg(params);
+        if (!legs[i])
+            continue;
+        float start             = energy_homing_start_angle_[i];
+        float omega_ff_rad_wcmp = -start * ds_dalpha * (3.14159265f / 180.0f) / ES_DURATION_S;
+        legs[i]->Set_Wheel_Target(wheel_rpms[i]);
+        legs[i]->Add_Wheel_Compensation(legs[i]->Wheel_Compensation(omega_ff_rad_wcmp));
     }
 
-    // Wheel motor health (ENERGY_SAVING uses Set_Wheel_Leg, not executeMotorCommands)
-    updateWheelDebug();
+    executeMotorCommands();
 }
 
 // =====================================================================
@@ -1290,25 +1478,61 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
 
     if (climb_stage_ == ClimbStage::HOMING_IN || climb_stage_ == ClimbStage::HOMING_OUT)
     {
-        // Smoothstep all legs from their captured start angle → 0°.
-        // Position control (kp=80, kd=4). Wheels follow joystick so the
-        // robot can still be driven while legs ramp to/from 0°.
+        // Smooth ES-style descent (HOMING_OUT) / entry (HOMING_IN):
+        //   target_now   = start * (1 - smoothstep(t/T))      // ramps start -> 0
+        //   omega_ff_rad = -start * d(smoothstep)/dt          // matched velocity FFW
+        //   ffw_gravity  = (M_est/4 + LEG_MASS) * g * r * sin(theta_now)
+        //   Kp/Kd        = ramp from per-leg start -> CLIMB_HOMING_KP/KD_END
+        //   tau_max      = 200 (DM hardware ceiling)
+        // Why this matters: under rider load the OLD path (kp=80, no FFW,
+        // tau_max=30) lagged the smoothstep target by ~9 deg at theta=90 --
+        // gravity won and the leg would "fall" the last few degrees into 0
+        // when PD finally caught up. Matched omega_ff + gravity FFW makes the
+        // PD do only error-correction; the leg now tracks the smoothstep
+        // continuously, identical feel to the ES descent (COMFORT->ES).
         float alpha = (float)climb_homing_ticks_ / (float)CLIMB_HOMING_FRAMES;
         if (alpha > 1.0f)
             alpha = 1.0f;
-        float s    = alpha * alpha * (3.0f - 2.0f * alpha);
-        float kp_h = CLIMB_HOMING_KP_END;
-        float kd_h = CLIMB_HOMING_KD_END;
+        float s         = alpha * alpha * (3.0f - 2.0f * alpha);   // smoothstep
+        float ds_dalpha = 6.0f * alpha * (1.0f - alpha);           // smoothstep derivative
+
+        constexpr float CLIMB_HOMING_TAU_MAX = 200.0f;
+        constexpr float CLIMB_HOMING_DURATION_S = CLIMB_HOMING_FRAMES * 0.002f;
+
+        // Loaded-chassis gravity FFW. M_est is the impedance estimator's
+        // last good value (carries forward from prior mode -- HOMING_IN from
+        // COMFORT inherits the warmed estimate; HOMING_OUT inherits from the
+        // ACTIVE branch's loaded seed). Same form as ES descent.
+        const float M_est_local        = impedance_.getEstimatedMass();
+        const float load_per_leg_local = M_est_local * 0.25f + LEG_MASS_kg;
+        const float r_m_local          = ECCENTRIC_OFFSET_r / 1000.0f;
+
         for (int i = 0; i < 4; i++)
         {
             if (!legs_top[i])
                 continue;
-            float cmd_deg = climb_homing_start_angle_[i] * (1.0f - s);
-            legs_top[i]->Set_Leg_Target(cmd_deg, 0.0f, 0.0f, kp_h, kd_h);
+            float start         = climb_homing_start_angle_[i];
+            float cmd_deg       = start * (1.0f - s);
+            // d(target)/dt = -start * ds/dalpha * (1/duration) in deg/s;
+            // convert deg -> rad for omega_ff (Set_Leg_PD_Torque expects rad/s).
+            float omega_ff_rad  = -start * ds_dalpha * (3.14159265f / 180.0f) / CLIMB_HOMING_DURATION_S;
+            // Use motor-feedback angle (not cmd_deg) for FFW so it tracks the
+            // actual pose -- under load the leg can lag the smoothstep target.
+            float sin_now       = sinf(deg2rad(legs_top[i]->Get_LegAngleWrapped()));
+            float ffw_gravity   = load_per_leg_local * GRAVITY_g * r_m_local * sin_now;
+            float kp_use        = climb_homing_kp_start_[i] + alpha * (CLIMB_HOMING_KP_END - climb_homing_kp_start_[i]);
+            float kd_use        = climb_homing_kd_start_[i] + alpha * (CLIMB_HOMING_KD_END - climb_homing_kd_start_[i]);
+            legs_top[i]->Set_Leg_PD_Torque(cmd_deg, omega_ff_rad, kp_use, kd_use, ffw_gravity, CLIMB_HOMING_TAU_MAX);
         }
 
-        // Wheel velocity control from joystick (with wheel-side compensation).
-        // legs_top order: FL, FR, BL, BR — matches inverseKinematics output.
+        // Wheel velocity control from joystick + FEEDFORWARD wheel
+        // compensation. The leg is being commanded at omega_ff_rad (the
+        // smoothstep derivative) -- the FB variant of Wheel_Compensation()
+        // would read leg_motor->getRPMFeedback() which lags this command
+        // and lets the wheel motor trail the leg accel -> wheel scrubs the
+        // ground during the homing sweep. Using the FF overload with the
+        // commanded leg omega closes the loop ahead of time.
+        // legs_top order: FL, FR, BL, BR -- matches inverseKinematics output.
         float wheel_rpms_h[4], vx_h = 0.0f, wz_h = 0.0f;
         controller_.Map_Joystick_To_Velocity(cmd, vx_h, wz_h);
         inverseKinematics(vx_h, 0, wz_h, wheel_rpms_h);
@@ -1316,8 +1540,12 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
         {
             if (!legs_top[i])
                 continue;
+            // Recompute the same omega_ff used for the leg PD above so the
+            // wheel comp matches the leg's commanded angular velocity.
+            float start             = climb_homing_start_angle_[i];
+            float omega_ff_rad_wcmp = -start * ds_dalpha * (3.14159265f / 180.0f) / CLIMB_HOMING_DURATION_S;
             legs_top[i]->Set_Wheel_Target(wheel_rpms_h[i]);
-            legs_top[i]->Add_Wheel_Compensation(legs_top[i]->Wheel_Compensation());
+            legs_top[i]->Add_Wheel_Compensation(legs_top[i]->Wheel_Compensation(omega_ff_rad_wcmp));
         }
 
         climb_homing_ticks_++;
@@ -1349,11 +1577,12 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
         // Wheels follow joystick (robot stays drivable while parked at 0°).
         float kp_h = CLIMB_HOMING_KP_END;
         float kd_h = CLIMB_HOMING_KD_END;
+        constexpr float WAIT_TAU_MAX = 30.0f;
         for (int i = 0; i < 4; i++)
         {
             if (!legs_top[i])
                 continue;
-            legs_top[i]->Set_Leg_Target(0.0f, 0.0f, 0.0f, kp_h, kd_h);
+            legs_top[i]->Set_Leg_PD_Torque(0.0f, 0.0f, kp_h, kd_h, 0.0f, WAIT_TAU_MAX);
         }
 
         float wheel_rpms_w[4], vx_w = 0.0f, wz_w = 0.0f;
@@ -1417,26 +1646,95 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
 
     // Gather per-leg feedback
     LegClimbFeedback fb[4] = {};
-    // Compute torque residual per leg: actual_torque - gravity_comp
-    float tres[4] = {FL_WheelLegs_ ? (FL_WheelLegs_->Get_LegTorqueFeedback() - FL_WheelLegs_->Get_LegGravityTorque()) : 0.0f,
-                     FR_WheelLegs_ ? (FR_WheelLegs_->Get_LegTorqueFeedback() - FR_WheelLegs_->Get_LegGravityTorque()) : 0.0f,
-                     BL_WheelLegs_ ? (BL_WheelLegs_->Get_LegTorqueFeedback() - BL_WheelLegs_->Get_LegGravityTorque()) : 0.0f,
-                     BR_WheelLegs_ ? (BR_WheelLegs_->Get_LegTorqueFeedback() - BR_WheelLegs_->Get_LegGravityTorque()) : 0.0f};
+    // Compute torque residual per leg using the ADAPTIVE gravity comp
+    // (impedance-estimator-driven, full loaded-chassis sin formula). The
+    // residual is then a direct measurement of the disturbance torque -- in
+    // steady state ~= 0 regardless of rider weight, spikes only when the
+    // wheel encounters an obstacle (step edge).
+    const float climb_ffw_load_per_leg = getAdaptiveLoadPerLeg();
+    const float climb_r_m              = ECCENTRIC_OFFSET_r / 1000.0f;
+    Wheel_Leg *legs_climb[4] = {FL_WheelLegs_, FR_WheelLegs_, BL_WheelLegs_, BR_WheelLegs_};
+    float tres[4] = {0, 0, 0, 0};
+    for (int i = 0; i < 4; i++)
+    {
+        if (!legs_climb[i])
+            continue;
+        float theta_rad = deg2rad(legs_climb[i]->Get_LegAngleWrapped());
+        float grav_static = climb_ffw_load_per_leg * GRAVITY_g * climb_r_m * sinf(theta_rad);
+        tres[i] = legs_climb[i]->Get_LegTorqueFeedback() - grav_static;
+    }
     if (FL_WheelLegs_)
-        fb[0] = {FL_WheelLegs_->Get_LegPosition(), FL_WheelLegs_->Get_WheelRPM(), tres[0]};
+        fb[0] = {FL_WheelLegs_->Get_LegAngleWrapped(), FL_WheelLegs_->Get_WheelRPM(), tres[0], FL_WheelLegs_->Get_LegVelocity()};
     if (FR_WheelLegs_)
-        fb[1] = {FR_WheelLegs_->Get_LegPosition(), FR_WheelLegs_->Get_WheelRPM(), tres[1]};
+        fb[1] = {FR_WheelLegs_->Get_LegAngleWrapped(), FR_WheelLegs_->Get_WheelRPM(), tres[1], FR_WheelLegs_->Get_LegVelocity()};
     if (BL_WheelLegs_)
-        fb[2] = {BL_WheelLegs_->Get_LegPosition(), BL_WheelLegs_->Get_WheelRPM(), tres[2]};
+        fb[2] = {BL_WheelLegs_->Get_LegAngleWrapped(), BL_WheelLegs_->Get_WheelRPM(), tres[2], BL_WheelLegs_->Get_LegVelocity()};
     if (BR_WheelLegs_)
-        fb[3] = {BR_WheelLegs_->Get_LegPosition(), BR_WheelLegs_->Get_WheelRPM(), tres[3]};
+        fb[3] = {BR_WheelLegs_->Get_LegAngleWrapped(), BR_WheelLegs_->Get_WheelRPM(), tres[3], BR_WheelLegs_->Get_LegVelocity()};
 
-    climbing_.config().step_height_m        = dbg_ctrl.step_height_mm / 1000.0f;
-    climbing_.config().torque_res_threshold = dbg_ctrl.torque_res_threshold;
-    climbing_.config().climb_omega          = dbg_ctrl.climb_omega;
+    climbing_.config().step_height_m              = dbg_ctrl.step_height_mm / 1000.0f;
+    climbing_.config().torque_res_threshold       = dbg_ctrl.torque_res_threshold;
+    climbing_.config().climb_omega                = dbg_ctrl.climb_omega;
+    climbing_.config().back_detect_hold_offset_deg = dbg_ctrl.climb_back_lift_offset_deg;
     const float dt                          = 0.002f;
 
     climbing_.update(fb, dt);
+
+    // ---- PREP-phase mass estimation ----
+    // While the legs sweep through theta_motor near 90 deg during PREP, the
+    // motor torque feedback satisfies the static balance equation
+    //   tau_motor = (M_per_leg + LEG_MASS) * g * r * sin(theta_motor)
+    // (dynamic terms I_eff*theta_ddot and damping are small for the 3s
+    // smoothstep). Inverting per-leg gives M_per_leg + LEG_MASS in real time.
+    // Accumulate during the high-sin window per leg; finalize after enough
+    // samples and seed impedance so the rest of CLIMBING (DETECT, CLIMBING,
+    // COMPLETE) has accurate FFW.
+    //
+    // This lets cold-start IDLE -> CLIMBING measure load (empty vs. rider)
+    // BEFORE accurate FFW is needed for DETECT / CLIMBING -- decouples
+    // climb-mass calibration from having to enter COMFORT first.
+    if (!climb_mass_estimated_)
+    {
+        Wheel_Leg *legs_mass[4] = {FL_WheelLegs_, FR_WheelLegs_, BL_WheelLegs_, BR_WheelLegs_};
+        const float r_m_mass    = ECCENTRIC_OFFSET_r / 1000.0f;
+        for (int i = 0; i < 4; i++)
+        {
+            if (!legs_mass[i] || climbing_.getPhase(i) != LegClimbPhase::PREP)
+                continue;
+            float theta_motor = legs_mass[i]->Get_LegAngleWrapped();
+            float s_motor     = sinf(deg2rad(theta_motor));
+            if (fabsf(s_motor) < PREP_MASS_SIN_THRESHOLD)
+                continue;
+            // m_per_leg_inst = tau / (g*r*sin) -- signed numerator and
+            // denominator give a consistent +m_per_leg regardless of which
+            // bending direction the leg uses (climb_sign cancels).
+            float tau    = legs_mass[i]->Get_LegTorqueFeedback();
+            float m_inst = tau / (GRAVITY_g * r_m_mass * s_motor);
+            prep_mass_load_sum_[i] += m_inst;
+            prep_mass_count_[i]++;
+        }
+
+        // Finalize when every leg has accumulated enough samples (in-sync
+        // smoothstep means counts are similar). Average per leg, sum, subtract
+        // 4*LEG_MASS to get the SPRUNG (chassis + rider) mass.
+        int min_count = prep_mass_count_[0];
+        for (int i = 1; i < 4; i++)
+            if (prep_mass_count_[i] < min_count) min_count = prep_mass_count_[i];
+
+        if (min_count >= PREP_MASS_MIN_SAMPLES)
+        {
+            float load_total = 0.0f;
+            for (int i = 0; i < 4; i++)
+                load_total += prep_mass_load_sum_[i] / (float)prep_mass_count_[i];
+            // load_total = sum of (M/4 + LEG_MASS) per leg = M + 4*LEG_MASS
+            float M_inst = load_total - 4.0f * LEG_MASS_kg;
+            if (M_inst < 0.0f)
+                M_inst = 0.0f;
+            climb_mass_estimate_kg_ = M_inst;
+            climb_mass_estimated_   = true;
+            impedance_.seedMass(M_inst);  // sync impedance for future COMFORT entry
+        }
+    }
 
     // Ground Contact Warp Compensation (reuse leg currents from feedback)
     float leg_currents_c[4] = {FL_WheelLegs_ ? FL_WheelLegs_->Get_LegCurrentFeedback() : 0.0f,
@@ -1477,22 +1775,56 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
     // Target height sent to FL (m) — check in Ozone to diagnose height issues
     dbg_climb.target_h = climbing_.isDirectControl(0) ? climbing_.getTargetHeight(0) : target_chassis_height_;
 
-    // Pitch lean bias during climbing — gravitational "push" toward climbing wheels
-    // Active during PREP/DETECT/CLIMBING (not just CLIMBING) so weight shifts early.
-    float pitch_setpoint = 0.0f;
+    // ---- A4tt: phase-aware pitch bias (unloads the wheels that are climbing) ----
+    //
+    // Stage 1: front not yet COMPLETE (PREP / DETECT / CLIMBING on FL/FR)
+    //   target = +climb_pitch_front_deg (+15 deg nose UP)
+    //   Shifts CoM backward, unloading front wheels for easier pivot.
+    //
+    // Stage 2: front COMPLETE, back still active
+    //   target = climb_pitch_back_deg (-5 deg nose DOWN)
+    //   Shifts CoM forward; back wheels lighter -> easier roll forward to
+    //   contact step, easier pivot once they reach it.
+    //
+    // Stage 3: all COMPLETE
+    //   target = 0 (level)
+    //
+    // LPF smooths the +15 -> -5 jump (20 deg setpoint swing) over ~1.2 s so
+    // the chassis doesn't snap-transition; passenger feels each attitude
+    // change as a gentle lean, not a jolt.
     auto phFL = climbing_.getPhase(0), phFR = climbing_.getPhase(1);
     auto phBL = climbing_.getPhase(2), phBR = climbing_.getPhase(3);
+    // Convenience flags (kept names for other uses below, e.g. PID gating).
     bool front_active = (phFL == LegClimbPhase::PREP || phFL == LegClimbPhase::DETECT || phFL == LegClimbPhase::CLIMBING ||
                          phFR == LegClimbPhase::PREP || phFR == LegClimbPhase::DETECT || phFR == LegClimbPhase::CLIMBING);
     bool back_active  = (phBL == LegClimbPhase::PREP || phBL == LegClimbPhase::DETECT || phBL == LegClimbPhase::CLIMBING ||
                          phBR == LegClimbPhase::PREP || phBR == LegClimbPhase::DETECT || phBR == LegClimbPhase::CLIMBING);
-    // Keep separate flags for pitch suppression (only suppress during actual CLIMBING)
     bool front_climbing = (phFL == LegClimbPhase::CLIMBING || phFR == LegClimbPhase::CLIMBING);
     bool back_climbing  = (phBL == LegClimbPhase::CLIMBING || phBR == LegClimbPhase::CLIMBING);
-    if (front_active)
-        pitch_setpoint = -dbg_ctrl.climb_pitch_bias;  // lean forward to load front wheels
-    else if (back_active)
-        pitch_setpoint = dbg_ctrl.climb_pitch_bias;  // lean backward to load back wheels
+    bool front_all_complete = (phFL == LegClimbPhase::COMPLETE && phFR == LegClimbPhase::COMPLETE);
+
+    float target_pitch_deg = 0.0f;
+    if (!front_all_complete && front_active)
+    {
+        // Stage 1: front-active. Nose UP to unload front.
+        target_pitch_deg = dbg_ctrl.climb_pitch_front_deg;
+    }
+    else if (front_all_complete && back_active)
+    {
+        // Stage 2: front done, back working. Nose DOWN to shift CoM forward.
+        target_pitch_deg = dbg_ctrl.climb_pitch_back_deg;
+    }
+    // else: stage 3 (all done) or initial (no leg yet in any phase) -> 0
+
+    // LPF for smooth passenger-friendly transitions.
+    static float pitch_sp_filt = 0.0f;
+    pitch_sp_filt = dbg_ctrl.climb_pitch_lpf_alpha * target_pitch_deg +
+                    (1.0f - dbg_ctrl.climb_pitch_lpf_alpha) * pitch_sp_filt;
+    float pitch_setpoint = pitch_sp_filt;
+
+    // Expose to plot for tuning visibility
+    dbg_climb_plot.pitch_setpoint_raw_deg  = target_pitch_deg;
+    dbg_climb_plot.pitch_setpoint_filt_deg = pitch_setpoint;
 
     // Body Leveling PID
     float roll_h_adj  = roll_pid(0.0f, clampSym(chassis_roll_, max_roll_deg_));
@@ -1521,9 +1853,10 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
     // Climbing angle sign per leg: picks one of the two ±θ solutions of the
     // inverse kinematics so each leg bends in the physically-correct direction.
     //   angle_cmd = climb_sign[i] * (180 - prep_theta)
-    // Because the climbing path is pure velocity servo (Pos_KP=0), a leg can only
-    // rest at the sign its climb_sign dictates: +1 -> +θ, -1 -> -θ.
-    float climb_sign[4] = {1.0f, -1.0f, 1.0f, 1.0f};
+    // Confirmed empirically (left/right mirror): FL/BL go positive, FR/BR
+    // negative. With the unified torque-track this sign is the ONLY thing that
+    // distinguishes the four legs' commanded targets (magnitude is identical).
+    float climb_sign[4] = {1.0f, -1.0f, 1.0f, -1.0f};
 
     for (int i = 0; i < 4; i++)
     {
@@ -1578,90 +1911,226 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
         {
             // --- Trigger debug: direct angle command, verify climbing direction ---
             // climb_sign[i] picks the physically-correct ±θ branch per leg.
-            float angle_cmd_dbg = climb_sign[i] * trigger_mag[i];
-            float ffw           = legs[i]->Get_LegGravityTorque();
-            legs[i]->Set_Leg_Target(angle_cmd_dbg, 0.0f, ffw, kp_use, kd_use);
+            float angle_cmd_dbg            = climb_sign[i] * trigger_mag[i];
+            float ffw                      = legs[i]->Get_LegGravityTorque();
+            constexpr float MANUAL_TAU_MAX = 30.0f;
+            legs[i]->Set_Leg_PD_Torque(angle_cmd_dbg, 0.0f, kp_use, kd_use, ffw, MANUAL_TAU_MAX);
             dbg_angle_cmd[i] = angle_cmd_dbg;
         }
         else if (climbing_.isDirectControl(i))
         {
-            // --- Velocity-tracking control for climbing phases ---
-            // Climbing_Dynamics gives us:
-            //   theta_unsigned: per-tick trajectory target (180°=highest, 0°=lowest)
-            //   omega_unsigned: trajectory angular velocity feed-forward (rad/s)
+            // --- Unified computed-torque control for ALL climbing phases ---
+            // One continuous law (no velocity<->position switch, no motor Pos_KP).
+            // Wheel_Leg::Set_Leg_Torque_Track computes gravity + software PD and
+            // sends it as FFW torque only, tracking the target in the continuous
+            // (unwrapped) frame so the leg never unwinds across the +/-180 seam.
             //
-            // We used to send the (signed) target angle as a position command with
-            // the motor running Pos_KP closed-loop. Because the MIT frame wraps
-            // position into [-π, π], a target that crosses the ±180° boundary —
-            // e.g. when the leg starts on the opposite wrap side from the command —
-            // makes the DM solver pick the long way round and the motor spins a
-            // full turn before settling. The mitigation: keep the *target angle*
-            // for visibility but actually drive the motor with a velocity command
-            // computed from the shortest-path error to that target. Pos_KP is set
-            // to 0 so the motor's internal position loop can't introduce the wrap
-            // bug; the angular velocity loop (Vel_KD) does the work.
+            // Climbing_Dynamics gives the unsigned trajectory; climb_sign[i]
+            // picks the physical bending solution (and direction of motion).
             float theta_unsigned = climbing_.getTargetThetaDeg(i);
-            float omega_unsigned = climbing_.getTargetOmega(i);  // rad/s, negative when θ decreasing
+            float omega_unsigned = climbing_.getTargetOmega(i);  // rad/s, neg when θ decreasing
+            float ffw_omega_rad  = climb_sign[i] * omega_unsigned;
 
-            // climb_sign: FL/FR = -1, BL/BR = +1. Both mirrors converge toward 0°.
-            float angle_cmd     = climb_sign[i] * theta_unsigned;
-            float ffw_omega_rad = climb_sign[i] * omega_unsigned;  // trajectory feed-forward (rad/s)
-
-            // Pitch leveling for direct-control legs (PREP/DETECT/CLIMBING/COMPLETE).
-            // The height pipeline can't reach them, so convert PID output (meters)
-            // → angle offset (degrees) using H = R + r·cos(θ), dθ = -dH/(r·sin(θ)).
+            // Pitch leveling for direct-control legs: PID output (m) -> leg
+            // angle (deg) via a CONSTANT gain dH/r, no 1/sin(theta) kinematic
+            // transform.
+            //
+            // Why no 1/sin: dtheta = dH / (r*sin(theta)) is the kinematically
+            // exact "how much do I rotate the leg to deliver dH chassis-height
+            // change", but it diverges as theta -> ±180 (sin(165°)=0.26,
+            // sin(170°)=0.17, ...). At PREP angles the leg has REDUCED authority
+            // to correct chassis tilt -- that's geometric truth, not a bug. The
+            // 1/sin transform tells the leg "rotate 250 deg to deliver the 8 cm
+            // the PID asked for", and the saturating ±50 deg clamp then traps
+            // the loop in an asymmetric relaxation oscillator against the
+            // new_theta [15, 165] cap: PID demands +dtheta -> clamped to 165 ->
+            // no effect; PID demands -dtheta -> leg drops 50 deg -> overshoots
+            // -> repeat. That's "climb to PREP 抖个不停".
+            //
+            // Principled fix: accept the geometric truth. Command angle
+            // adjustment PROPORTIONAL to the PID's height output via the
+            // single calibration constant 1/r (= the same gain COMFORT
+            // happens to deliver at theta=90 where sin=1). lev_scale and
+            // BODY_PID_SCALE_PITCH match the effective authority used in the
+            // non-direct branch and in COMFORT respectively, so leveling
+            // behavior is consistent across modes. The 10 deg final clamp is
+            // a safety bound well below the 15 deg new_theta-clamp headroom
+            // (no saturation against the boundary).
+            // PHASE GATE for PID dtheta:
+            // PREP / DETECT: NO body-PID dtheta. Legs MUST sit cleanly at the
+            //   smoothstep target with zero PID interference, so (a) PREP->DETECT
+            //   transition criterion (|fb - prep_motor_angle| < 3 deg) is reachable,
+            //   and (b) DETECT can read true torque-residual disturbance without
+            //   PID-induced motion creating false spikes.
+            // CLIMBING / COMPLETE: PID dtheta active for active body leveling
+            //   during/after the kinematic climb.
+            // Without this gate, PID dtheta of -5 deg on BL/BR during DETECT
+            // generates continuous Kp*err output -> false residual spikes ->
+            // BL/BR false-trigger DETECT->CLIMBING before FL/FR actually contact.
+            LegClimbPhase ph_i_gate = climbing_.getPhase(i);
+            float phase_gate        = (ph_i_gate == LegClimbPhase::CLIMBING || ph_i_gate == LegClimbPhase::COMPLETE) ? 1.0f : 0.0f;
+            float dh = lev_scale * BODY_PID_SCALE_PITCH * lev_signs[i][0] * pitch_h_adj * phase_gate;
+            float dtheta_deg = dh / r_m * (180.0f / 3.14159265f);
+            // Clamp +/- 5 deg: well below the 15 deg new_theta-boundary
+            // headroom on both sides, so the PID-driven dtheta can never
+            // hit the [15, 165] clamp. This prevents the asymmetric-
+            // saturation relaxation oscillator (one polarity clamped to 0
+            // effect, the other polarity full +/-5 deg) that drove the
+            // previous shake. With Kp=80 in the flat PD, 5 deg position
+            // error -> Kp*err = 80 * 0.087 = ~7 Nm of correction torque,
+            // an order of magnitude smaller than the gravity FFW (~15 Nm
+            // at theta=90) -- so PID leveling is a true MICRO-adjustment
+            // on top of FFW's static balance, not a competing controller.
+            if (dtheta_deg > 5.0f)
+                dtheta_deg = 5.0f;
+            if (dtheta_deg < -5.0f)
+                dtheta_deg = -5.0f;
+            float new_theta = theta_unsigned + dtheta_deg;
+            // Clamp the commanded motor angle to [prep_margin, 180-prep_margin]
+            // = [15, 165] by default. Two things this guards against:
+            //   1) NearestEquivalentTarget wrap-flip near the +/-180 seam (tiny
+            //      HOMING residual in pos_cont could otherwise flip the target
+            //      to the opposite hemisphere and send the leg the LONG way).
+            //   2) Position-loop OVERSHOOT crossing +/-180. The PD is somewhat
+            //      underdamped, so the leg overshoots the commanded angle by
+            //      ~10-20 deg. Keeping the target at most 15 deg from the seam
+            //      means even a 15 deg overshoot lands at <180 and the leg
+            //      settles cleanly at the target without ever crossing.
+            // Leveling can push theta DOWN from the prep angle (raising the
+            // chassis on that leg) but never past the prep pose itself.
+            //
+            // A4ab: relax upper clamp for back legs after FL/FR COMPLETE so
+            // Climbing_Dynamics can drive BL/BR's DETECT hold angle past 165
+            // (e.g. to 170-175) via back_detect_hold_offset_deg, achieving
+            // a back-lift / CoM-shift before BL/BR's own contact phase. 5 deg
+            // margin still keeps the seam clear (overshoot from the leg PD
+            // is bounded since DETECT uses Kp=200 -> tight tracking).
+            const float prep_margin = climbing_.config().prep_theta_deg;
+            float upper_clamp = 180.0f - prep_margin;  // default 165
             {
-                float dh      = lev_signs[i][0] * pitch_h_adj;  // full PID output
-                float thu_rad = theta_unsigned * 3.14159265f / 180.0f;
-                float sin_thu = sinf(thu_rad);
-                if (fabsf(sin_thu) < 0.15f)
-                    sin_thu = copysignf(0.15f, sin_thu);
-                float dtheta_deg = -dh / (r_m * sin_thu) * (180.0f / 3.14159265f);
-                // Clamp offset and final angle to safe range
-                if (dtheta_deg > 50.0f)
-                    dtheta_deg = 50.0f;
-                if (dtheta_deg < -50.0f)
-                    dtheta_deg = -50.0f;
-                float new_theta = theta_unsigned + dtheta_deg;
-                if (new_theta > 180.0f)
-                    new_theta = 180.0f;
-                if (new_theta < 0.0f)
-                    new_theta = 0.0f;
-                angle_cmd = climb_sign[i] * new_theta;
+                bool is_back_local = (i >= 2);
+                bool front_all_complete_local =
+                    (climbing_.getPhase(0) == LegClimbPhase::COMPLETE &&
+                     climbing_.getPhase(1) == LegClimbPhase::COMPLETE);
+                if (is_back_local && front_all_complete_local)
+                    upper_clamp = 175.0f;  // 5 deg seam margin
             }
+            if (new_theta > upper_clamp)
+                new_theta = upper_clamp;
+            if (new_theta < prep_margin)
+                new_theta = prep_margin;
+            float angle_cmd = climb_sign[i] * new_theta;
 
-            // Shortest-path angular error in (-180°, +180°] — kills the wraparound bug.
-            float cur_deg = legs[i]->Get_LegPosition();
-            float err_deg = angle_cmd - cur_deg;
-            while (err_deg > 180.0f)
-                err_deg -= 360.0f;
-            while (err_deg <= -180.0f)
-                err_deg += 360.0f;
-            float err_rad = err_deg * (3.14159265f / 180.0f);
+            // Body-mass-aware sin-based gravity FFW. Uses ADAPTIVE load
+            // from `getAdaptiveLoadPerLeg()` (impedance-estimator-driven,
+            // self-calibrating to actual rider weight). This is the same
+            // load source used for the residual computation -- so in steady
+            // state, the leg torque feedback exactly cancels with the FFW
+            // and the residual is ~0 (clean direct measurement of any
+            // disturbance).
+            //
+            // Critical: use theta_unsigned (smoothstep target) signed by
+            // climb_sign, NOT angle_cmd which includes the body-PID dtheta.
+            // If FFW followed angle_cmd, PID swings would step-change the
+            // gravity FFW (sin(165)=0.26 vs sin(115)=0.91 -> 3.5x torque jump
+            // for a 50 deg dtheta swing) -- amplifying the body-PID loop's
+            // output into a leg-torque disturbance that re-tilts the chassis.
+            float ffw_climb = climb_ffw_load_per_leg * GRAVITY_g * climb_r_m
+                              * sinf(deg2rad(climb_sign[i] * theta_unsigned));
 
-            // P-controller (position-error → velocity) + trajectory feed-forward.
-            const float kp_vel    = climbing_.config().climb_pos_kp_vel;
-            const float omega_lim = climbing_.config().climb_omega_max;
-            float vel_cmd_rad     = kp_vel * err_rad + ffw_omega_rad;
-            if (vel_cmd_rad > omega_lim)
-                vel_cmd_rad = omega_lim;
-            if (vel_cmd_rad < -omega_lim)
-                vel_cmd_rad = -omega_lim;
-
-            // Velocity-only MIT: Pos_KP = 0 so the motor ignores the position target
-            // (no more ±π long-way-around). The Pos_KP-zero path means we don't care
-            // what position we hand to Set_Leg_Target; send current position so any
-            // ramp / slew limiter inside Wheel_Leg stays in sync with reality.
-            float ffw = legs[i]->Get_LegGravityTorque();
-            legs[i]->Set_Leg_Target(cur_deg, vel_cmd_rad, ffw, 0.0f, kd_use);
+            // Flat PD-as-torque (matches the architecture the user described
+            // and the rest of the modes -- COMFORT / HOMING_IN/OUT / FREE all
+            // use Set_Leg_PD_Torque). Switched from the cascade controller
+            // (Set_Leg_Torque_Track, kp_pos -> omega_clamp -> kd_vel) because
+            // the cascade's outer-loop bandwidth (~1.3 Hz with kp_pos=8) was
+            // close to the body-PID LPF bandwidth (~1.6 Hz), causing resonance
+            // when the body-PID's per-leg dtheta acted as a position
+            // disturbance into the cascade. The flat PD has a higher natural
+            // frequency than the body-PID LPF, no internal velocity-clamp
+            // saturation, so the body-PID loop can't excite a resonant mode.
+            //
+            // Control law:  tau = Kp*(angle_cmd - actual) + Kd*(omega_ff - omega_actual) + ffw
+            //   - ffw    : balances rider weight at this leg angle (sin formula)
+            //   - Kp*P   : holds position firmly against disturbances
+            //   - Kd*V   : damps motion / softly limits speed
+            //   - omega_ff: matched smoothstep derivative -> Kd doesn't fight commanded motion
+            // All computed in software with NearestEquivalentTarget and motor
+            // Pos_KP=Vel_KD=0 -> no multi-turn unwind, no DM internal-loop
+            // surprises.
+            //
+            // PHASE-DEPENDENT Kp/Kd: each climbing phase has different
+            // physical demands, so a single stiffness compromises somewhere.
+            //
+            //   PREP     (40/2): soft smoothstep lift -- avoids "rigid"
+            //                    feel at lift start, gentle on passenger.
+            //   DETECT  (200/5): RIGID hold against horizontal step force.
+            //                    Wheel pressed against step face pushes
+            //                    chassis forward -> leg arm rotates back ->
+            //                    soft Kp lets leg yield 30 deg before
+            //                    generating enough torque to trigger
+            //                    threshold. WORSE: detect_settle_omega=0.4
+            //                    gates off detection while leg is yielding,
+            //                    so the spike that should fire DETECT->
+            //                    CLIMBING is suppressed. Kp=200 keeps leg
+            //                    within ~2 deg of target -> motor delivers
+            //                    full reaction force as torque (not yield)
+            //                    -> residual spikes cleanly, leg vel stays
+            //                    below settle gate -> detection fires.
+            //   CLIMBING (80/4): firm trajectory tracking, mid-stiffness.
+            //   COMPLETE (80/4): firm hold at end-of-climb pose.
+            float CLIMB_PD_KP, CLIMB_PD_KD;
+            switch (climbing_.getPhase(i))
+            {
+                case LegClimbPhase::PREP:
+                    CLIMB_PD_KP = 40.0f;
+                    CLIMB_PD_KD = 2.0f;
+                    break;
+                case LegClimbPhase::DETECT:
+                    CLIMB_PD_KP = 200.0f;
+                    CLIMB_PD_KD = 5.0f;
+                    break;
+                case LegClimbPhase::CLIMBING:
+                case LegClimbPhase::COMPLETE:
+                default:
+                    CLIMB_PD_KP = 80.0f;
+                    CLIMB_PD_KD = 4.0f;
+                    break;
+            }
+            constexpr float CLIMB_PD_TAU_MAX = 200.0f;
+            legs[i]->Set_Leg_PD_Torque(angle_cmd, ffw_omega_rad, CLIMB_PD_KP, CLIMB_PD_KD, ffw_climb, CLIMB_PD_TAU_MAX);
             dbg_angle_cmd[i] = angle_cmd;
+
+            // Per-leg TARGET diagnostics. All four legs run the IDENTICAL
+            // program logic, so theta_unsigned should match across legs and
+            // angle_cmd should differ only by climb_sign + a small leveling
+            // offset. If any leg diverges here, the bug is upstream of the
+            // motor / torque control (Ozone: watch dbg_climb_tgt).
+            dbg_climb_tgt.theta_unsigned[i] = theta_unsigned;
+            dbg_climb_tgt.angle_cmd[i]      = angle_cmd;
+            dbg_climb_tgt.angle_fb[i]       = legs[i]->Get_LegAngleWrapped();
+            dbg_climb_tgt.pos_cont[i]       = legs[i]->Get_LegAngleUnwrapped();
+            // (TT_* fields are vestigial -- cascade was replaced by flat PD in A4jj.
+            //  Kept for HW-debug rollback only; will be removed in A5.)
+            dbg_climb_tgt.omega_cmd[i] = legs[i]->Get_TT_OmegaCmd();
+            dbg_climb_tgt.omega_fb[i]  = legs[i]->Get_TT_OmegaFb();
+            dbg_climb_tgt.tau_total[i] = legs[i]->Get_TT_TauTotal();
+
+            // ---- Plot-friendly aggregated signals (DbgClimbPlot) ----
+            dbg_climb_plot.target_theta_deg[i] = angle_cmd;
+            dbg_climb_plot.angle_fb_deg[i]     = legs[i]->Get_LegAngleWrapped();
+            dbg_climb_plot.dtheta_pid_deg[i]   = dtheta_deg;
+            dbg_climb_plot.target_omega_rad[i] = ffw_omega_rad;
+            dbg_climb_plot.actual_omega_rad[i] = legs[i]->Get_LegVelocity();
+            dbg_climb_plot.ffw_grav_nm[i]      = ffw_climb;
+            dbg_climb_plot.tau_fb_nm[i]        = legs[i]->Get_LegTorqueFeedback();
+            dbg_climb_plot.residual_nm[i]      = tres[i];  // = tau_fb - grav_at_angle_fb
         }
         else
         {
             // Normal height pipeline (COMFORT-like, or manual trigger)
             legs[i]->Set_Leg_Height(clampHeight(h_targets[i]), v_targets[i], kp_use, kd_use, legs[i]->Get_LegGravityTorque());
             // Show actual motor feedback for non-climbing legs (so BL/BR don't show 0)
-            dbg_angle_cmd[i] = legs[i]->Get_LegPosition();
+            dbg_angle_cmd[i] = legs[i]->Get_LegAngleWrapped();
         }
     }
 
@@ -1685,47 +2154,179 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
     dbg_climb.raw_theta_bl = climbing_.getTargetThetaDeg(2) * climb_sign[2];
     dbg_climb.raw_theta_br = climbing_.getTargetThetaDeg(3) * climb_sign[3];
 
-    // Wheel velocity + execute
-    // Add forward RPM throughout entire climbing sequence (including all COMPLETE).
-    // Only stops when user switches out of CLIMBING mode.
-    float climb_base_rpm = 0.0f;
-    for (int i = 0; i < 4; i++)
+    // ---- DbgClimbPlot: chassis-wide signals + per-leg phase/beta/baseline ----
+    for (int k = 0; k < 4; k++)
     {
-        LegClimbPhase ph = climbing_.getPhase(i);
-        if (ph == LegClimbPhase::CLIMBING || ph == LegClimbPhase::COMPLETE)
+        LegClimbPhase ph_k                     = climbing_.getPhase(k);
+        dbg_climb_plot.phase[k]                = static_cast<uint8_t>(ph_k);
+        dbg_climb_plot.beta_rad[k]             = climbing_.getBeta(k);
+        dbg_climb_plot.residual_baseline_nm[k] = climbing_.getBaseline(k);
+        // Threshold-compare deviation (matches the value Climbing_Dynamics tests).
+        float dev_k                            = fabsf(dbg_climb_plot.residual_nm[k] - climbing_.getBaseline(k));
+        dbg_climb_plot.residual_dev_nm[k]      = dev_k;
+
+        // Peak hold: reset on phase change, then accumulate max.
+        if (ph_k != residual_peak_last_phase_[k])
         {
-            climb_base_rpm = climbing_.config().climb_omega * (60.0f / (2.0f * 3.14159265f)) * dbg_ctrl.climb_wheel_scale;
-            break;
+            residual_peak_[k]              = 0.0f;
+            residual_peak_last_phase_[k]   = ph_k;
         }
+        if (dev_k > residual_peak_[k])
+            residual_peak_[k] = dev_k;
+        dbg_climb_plot.residual_peak_nm[k] = residual_peak_[k];
     }
-    dbg_climb.wheel_rpm = climb_base_rpm;
+    dbg_climb_plot.torque_res_threshold_nm = climbing_.config().torque_res_threshold;
+    dbg_climb_plot.beta0_rad              = climbing_.getBeta0();
+    // pitch_setpoint_raw_deg / pitch_setpoint_filt_deg already populated
+    // earlier in A4tt phase-bias block; only fill the remaining IMU + PID
+    // state here.
+    dbg_climb_plot.pitch_fb_deg           = chassis_pitch_;
+    dbg_climb_plot.pitch_h_adj_m          = pitch_h_adj;
+    // PREP smoothstep progress for plot (recomputed standalone since the
+    // per-leg ramp_progress variable was removed when A4uu gated PID dtheta
+    // by phase). Same value across all 4 legs (synchronized smoothstep).
+    {
+        float theta_unsigned_fl = climbing_.getTargetThetaDeg(0);
+        float prep_full_fl      = 180.0f - climbing_.config().prep_theta_deg;
+        dbg_climb_plot.prep_ramp_progress = (prep_full_fl > 1.0f)
+                                            ? fminf(theta_unsigned_fl / prep_full_fl, 1.0f)
+                                            : 1.0f;
+    }
+    dbg_climb_plot.M_est_climb_kg      = impedance_.getEstimatedMass();
+    dbg_climb_plot.ffw_load_per_leg_kg = climb_ffw_load_per_leg;
+
+    // A4yy: back-settle countdown for plot visibility. While > 0, BL/BR are
+    // blocked from DETECT->CLIMBING regardless of residual. Watch this drop
+    // to 0 ~1 sec after FL/FR enter CLIMBING.
+    dbg_climb_plot.back_settle_remaining_s = climbing_.getBackSettleRemaining();
+
+    // PREP-phase mass estimator state -- watch in Ozone to see the live
+    // measurement converge: sample_count rises during PREP, then once
+    // prep_mass_estimated flips to 1, prep_mass_estimate_kg shows the
+    // measured sprung mass (~23 empty, ~73 fully loaded with 50 kg rider).
+    dbg_climb_plot.prep_mass_estimate_kg = climb_mass_estimate_kg_;
+    dbg_climb_plot.prep_mass_estimated   = climb_mass_estimated_ ? 1 : 0;
+    for (int k = 0; k < 4; k++)
+        dbg_climb_plot.prep_mass_sample_count[k] = static_cast<uint16_t>(prep_mass_count_[k]);
+
+    // Wheel velocity + execute. Old logic auto-boosted wheel rpm by
+    // `climb_omega * climb_wheel_scale` whenever any leg was in CLIMBING or
+    // COMPLETE -- a band-aid for under-powered old motors that needed extra
+    // wheel speed to actually crawl up steps. With the new higher-torque
+    // motors that boost is unnecessary AND counterproductive: it makes the
+    // chassis suddenly accelerate the moment ONE leg flips to COMPLETE,
+    // even with no joystick input. Now wheels follow joystick + FF wheel
+    // compensation only (the FF comp from A4gg keeps the wheels rolling in
+    // sync with leg motion during PREP/CLIMBING, so the leg doesn't fight
+    // the wheel). The natural Kd*V damping on the leg PD takes the motor to
+    // whatever output is required -- it's no longer artificially capped.
+    dbg_climb.wheel_rpm = 0.0f;
 
     float wheel_rpms[4], vx = 0.0f, wz = 0.0f;
     controller_.Map_Joystick_To_Velocity(cmd, vx, wz);
-    // Only add climb boost when user is pushing forward (vx > 0)
-    if (vx > 0.5f)
-        vx += climb_base_rpm;
     inverseKinematics(vx, 0, wz, wheel_rpms);
 
-    if (FL_WheelLegs_)
+    // A4xx: wheel speed cap during CLIMBING.
+    //
+    // During CLIMBING, the chassis moves forward at v_chassis ~= R *
+    // cos(beta) * phi_w (wheel pivoting around step edge). With
+    // climb_omega = 0.5 rad/s and R = 0.1 m, peak chassis speed is ~0.05
+    // m/s. If user pushes joystick to full (~0.5 m/s), wheel motor is
+    // commanded 10x the chassis-matching rate -> wheel slips at the
+    // step contact / drags forward, the leg motor sees reaction torque,
+    // and CLIMBING tracking degrades.
+    //
+    // Fix: cap |wheel_rpm| by phi_w-derived chassis-matching rate when
+    // any leg is in CLIMBING. phi_w starts at 0 (smoothstep ramp from
+    // A4ww), grows to climb_omega over climb_ramp_s -> cap ramps from
+    // 0 to ~chassis_max naturally. After CLIMBING, no cap (PREP/DETECT/
+    // COMPLETE all return phi_w = 0; the loop below skips them).
+    //
+    // Wheel RPM for matched rolling on flat ground:
+    //   v_wheel_surface = omega_wheel * R = v_chassis
+    //   omega_wheel = v_chassis / R = phi_w * cos(beta)
+    //   rpm = omega_wheel * 60 / (2*pi)
+    // Use cos(beta) ~ 1 for small beta -- worst case is a slight
+    // over-cap as beta grows, which still permits chassis-matching
+    // motion (margin shrinks but never goes negative since beta < pi/2).
+    // SAFETY ceiling on wheel RPM during CLIMBING regardless of how the user
+    // tunes climb_omega / climb_wheel_speed_ratio. 25 RPM corresponds to
+    // 25 * 2pi/60 * R = 0.26 m/s wheel surface velocity = 26 cm/s -- about
+    // 1/4 of normal walking pace. Even at this absolute max the chassis can
+    // never lurch forward beyond a slow walk, so passenger safety holds
+    // regardless of mis-tuning the inner ratios. Lower this if you want a
+    // tighter safety envelope.
+    constexpr float CLIMB_ABSOLUTE_MAX_WHEEL_RPM = 25.0f;
+    float climb_max_rpm = 1.0e9f;  // effectively no cap unless overridden below
+    for (int i = 0; i < 4; i++)
     {
-        FL_WheelLegs_->Set_Wheel_Target(wheel_rpms[0]);
-        FL_WheelLegs_->Add_Wheel_Compensation(FL_WheelLegs_->Wheel_Compensation());
+        float phi_w = climbing_.getEffectivePhiW(i);
+        dbg_climb_plot.climb_effective_phi_w[i] = phi_w;
+        if (phi_w > 1e-4f)
+        {
+            // chassis-matching wheel rate * user-tunable multiplier (A4yy):
+            // ratio=1.0 strict, 2.0 allow assistive joystick push, etc.
+            // Then capped by the absolute safety ceiling above.
+            float leg_cap = phi_w * (60.0f / (2.0f * 3.14159265f)) * dbg_ctrl.climb_wheel_speed_ratio;
+            if (leg_cap > CLIMB_ABSOLUTE_MAX_WHEEL_RPM)
+                leg_cap = CLIMB_ABSOLUTE_MAX_WHEEL_RPM;
+            if (leg_cap < climb_max_rpm)
+                climb_max_rpm = leg_cap;
+        }
     }
-    if (FR_WheelLegs_)
+    if (climb_max_rpm < 1.0e8f)
     {
-        FR_WheelLegs_->Set_Wheel_Target(wheel_rpms[1]);
-        FR_WheelLegs_->Add_Wheel_Compensation(FR_WheelLegs_->Wheel_Compensation());
+        for (int i = 0; i < 4; i++)
+        {
+            if (wheel_rpms[i] > climb_max_rpm)
+                wheel_rpms[i] = climb_max_rpm;
+            if (wheel_rpms[i] < -climb_max_rpm)
+                wheel_rpms[i] = -climb_max_rpm;
+        }
+        dbg_climb_plot.climb_max_wheel_rpm = climb_max_rpm;
     }
-    if (BL_WheelLegs_)
+    else
     {
-        BL_WheelLegs_->Set_Wheel_Target(wheel_rpms[2]);
-        BL_WheelLegs_->Add_Wheel_Compensation(BL_WheelLegs_->Wheel_Compensation());
+        dbg_climb_plot.climb_max_wheel_rpm = 0.0f;  // no cap active
     }
-    if (BR_WheelLegs_)
+
+    // Wheel compensation gating by climbing phase:
+    //
+    //   PREP     -> FF wheel comp (rolling on flat ground while leg lifts
+    //               chassis; commanded omega from smoothstep, no FB lag).
+    //   DETECT   -> NO comp (leg static; target_omega=0 -> comp would be 0
+    //               anyway, but explicit exclusion is clearer + robust).
+    //   CLIMBING -> NO comp.  Critical: the trajectory model has the wheel
+    //               PIVOTING around the step edge E (constraint cos(theta)
+    //               = (R+L-h-R*sin(beta))/L), NOT rolling on flat ground.
+    //               The wheel-comp formula leg_rpm * (1 + r/R*cos(theta))
+    //               assumes flat-ground rolling -- applying it here
+    //               commands the wheel to spin at the rolling rate, which
+    //               conflicts with the pivot-around-E geometry. The
+    //               reaction torque feeds back into the leg motor and
+    //               disturbs trajectory tracking.
+    //   COMPLETE -> NO comp (leg static, same as DETECT).
+    //   non-direct (IDLE, manual_climb) -> FB comp (normal rolling).
+    Wheel_Leg *legs_w[4]  = {FL_WheelLegs_, FR_WheelLegs_, BL_WheelLegs_, BR_WheelLegs_};
+    for (int i = 0; i < 4; i++)
     {
-        BR_WheelLegs_->Set_Wheel_Target(wheel_rpms[3]);
-        BR_WheelLegs_->Add_Wheel_Compensation(BR_WheelLegs_->Wheel_Compensation());
+        if (!legs_w[i])
+            continue;
+        legs_w[i]->Set_Wheel_Target(wheel_rpms[i]);
+
+        if (manual_climb || !climbing_.isDirectControl(i))
+        {
+            // IDLE leg (climbing pipeline not active here) or manual trigger:
+            // standard FB wheel comp (slow joystick-driven sweep, lag OK).
+            legs_w[i]->Add_Wheel_Compensation(legs_w[i]->Wheel_Compensation());
+        }
+        else if (climbing_.getPhase(i) == LegClimbPhase::PREP)
+        {
+            // PREP only: wheel rolls on flat ground as leg lifts chassis.
+            float omega_ff_wcmp = climb_sign[i] * climbing_.getTargetOmega(i);
+            legs_w[i]->Add_Wheel_Compensation(legs_w[i]->Wheel_Compensation(omega_ff_wcmp));
+        }
+        // DETECT / CLIMBING / COMPLETE: deliberately no wheel comp (see above).
     }
 
     executeMotorCommands();

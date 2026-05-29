@@ -112,7 +112,12 @@ class Impedance_Controller
         //     × g × r × sinθ), so position loop only tracks small deviations;
         //     a lower Kp is fine.
         float kv_base = 14000.0f;  // Base virtual stiffness (N/m)
-        float cv_base = 1500.0f;   // Base virtual damping (N·s/m).
+        // 1500 -> 3000 -> 5000. Roll damping still inadequate (user observed
+        // divergent oscillation) -- bumped further with the new unified torque
+        // path (no hardware Kd ceiling). Combined with mit_kd_max raised to
+        // 15 below, peak Kd at theta=90 is now ~15 Nm.s/rad. Heavy overdamp,
+        // sluggish but doesn't oscillate.
+        float cv_base = 5000.0f;   // Base virtual damping (N·s/m).
 
         // --- Skyhook Kd Modulation (DISABLED — accel_z noise too high) ---
         float cv_sky_gain = 0.0f;     // Disabled: accel-based velocity estimate is pure noise
@@ -142,24 +147,43 @@ class Impedance_Controller
         // per-leg balance |τ| = (M/4+m_leg)·g·r·|sin θ|; ka_times_gr is unused.
         float ffw_lpf_alpha = 0.01f;          // ~0.8 Hz LPF on M_est. Slower than mechanical
                                               // response → breaks self-feedback limit cycle.
+        // Early-RUN fast LPF: for the first `fast_lpf_duration_s` after reset()
+        // (i.e. on COMFORT entry), use `ffw_lpf_alpha_fast` instead of the slow
+        // value so M_est converges quickly from the load-biased seed to the
+        // ACTUAL load. Without this, the loaded seed massively over-FFWs an
+        // empty chassis for ~1 s (slow-LPF settling time), driving divergent
+        // roll oscillation before mass_scale can bring impedance gains down.
+        float ffw_lpf_alpha_fast = 0.1f;      // ~8 Hz, ~30 ms tau -- 5 taus in ~150 ms
+        float fast_lpf_duration_s = 1.5f;     // window length, then revert to slow alpha
         float mass_update_v_thresh = 0.04f;   // m/s; only update M_est when ALL legs settled
         float ka_times_gr          = 1.263f;  // DM J10010L_2EC: KA(0.1263 Nm/A) × GR(10) — kept for reference, unused
         float leg_mass             = LEG_MASS_kg;
 
-        // --- MIT Parameter Limits (hardware) ---
-        // DM J10010L MIT mode accepts Kp ∈ [0, 500], Kd ∈ [0, 5]; we leave headroom.
-        // Kd floor must be substantial: at small |sin θ| (near workspace limits)
-        // the impedance-computed Kd drops to nearly zero. Without a real floor,
-        // legs lose damping and rock chaotically.
+        // --- MIT Parameter Limits ---
+        // Historical context: these mit_*_max values were the DM J10010L MIT-
+        // mode hardware caps (Kp <= 500, Kd <= 5). After the A4 migration to
+        // software PD-torque (Pos_KP = Vel_KD = 0 on motor; all kp*err + kd*v
+        // done in software and sent as FFW), those hardware caps no longer
+        // apply -- the software kp/kd are just numerical multipliers. So we
+        // can raise mit_kd_max above 5 for stronger damping.
+        // Kd floor must remain substantial: at small |sin θ| (near workspace
+        // limits) the impedance-computed Kd drops to nearly zero. Without a
+        // real floor, legs lose damping and rock chaotically.
         float mit_kp_min = 50.0f;
         float mit_kp_max = 250.0f;
         float mit_kd_min = 2.5f;
-        float mit_kd_max = 5.0f;
+        // 5 -> 10 -> 15 because the software path has no motor-side ceiling
+        // and roll damping was still insufficient at Kd=10. Combined with
+        // cv_base=5000, raw_kd at theta=90 is 21 (clamped to 15). zeta ~3.4
+        // loaded -- heavy overdamp on roll, sluggish but no divergence.
+        float mit_kd_max = 15.0f;
 
         // --- Mode Transition Ramp ---
         float entry_kp  = 35.0f;   // Kp to blend FROM on mode entry (matches default MIT / ENGSAV)
         float entry_kd  = 1.5f;    // Kd to blend FROM
-        float ramp_rate = 0.005f;  // Ramp increment per cycle (0→1 in 200 cycles = 0.4s @500Hz)
+        // Slower ramp (0.005 -> 0.002, 0.4 s -> 1 s) softens the HOMING -> RUN
+        // transition users felt as "卡顿 from velocity-loop to impedance".
+        float ramp_rate = 0.002f;  // Ramp increment per cycle (0→1 in 500 cycles = 1.0s @500Hz)
 
         // --- Chassis Geometry (for rigid-body kinematics) ---
         float W_F = WHEEL_TRACK_FRONT / 1000.0f;
@@ -188,7 +212,7 @@ class Impedance_Controller
     /**
      * @brief Main update — call every control cycle (dt ≈ 2 ms)
      * @param leg_currents   [FL, FR, BL, BR] motor currents (A)
-     * @param leg_angles_deg [FL, FR, BL, BR] kinematic angles (deg, from Get_LegPosition)
+     * @param leg_angles_deg [FL, FR, BL, BR] kinematic angles (deg, from Get_LegAngleWrapped)
      * @param accel_z        Body vertical acceleration (m/s²), gravity removed
      * @param omega_roll     Roll angular velocity (rad/s)
      * @param omega_pitch    Pitch angular velocity (rad/s)
@@ -249,6 +273,11 @@ class Impedance_Controller
 
     // Mode transition ramp (0=entry, 1=full impedance)
     float ramp_alpha_ = 0.0f;
+
+    // Early-RUN fast-LPF countdown (seconds remaining). Reset on reset() to
+    // cfg_.fast_lpf_duration_s; decremented by dt in update(). When > 0 the
+    // mass-estimate LPF uses ffw_lpf_alpha_fast; otherwise ffw_lpf_alpha.
+    float fast_lpf_remaining_s_ = 0.0f;
 };
 
 }  // namespace Applications
