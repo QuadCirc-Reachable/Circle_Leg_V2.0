@@ -1611,6 +1611,29 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
 
     // climb_stage_ == ACTIVE → fall through to original climbing pipeline
 
+    // A4ar: MANUAL back-pair trigger on BTN_X rising during ACTIVE. If
+    // auto-detection of back-wheel step-contact is unreliable, the operator
+    // can position the back wheels at the step and press BTN_X again to
+    // force-trigger BL/BR climb (bypasses all DETECT gates). Only allowed
+    // when FL/FR are BOTH COMPLETE (back can't climb before front anyway).
+    {
+        bool x_now_active  = (cmd.button_status & BTN_X);
+        bool x_prev_active = (climb_last_buttons_ & BTN_X);
+        if (x_now_active && !x_prev_active)
+        {
+            bool front_both_complete =
+                (climbing_.getPhase(0) == LegClimbPhase::COMPLETE &&
+                 climbing_.getPhase(1) == LegClimbPhase::COMPLETE);
+            if (front_both_complete)
+            {
+                float bl_deg = BL_WheelLegs_ ? BL_WheelLegs_->Get_LegAngleWrapped() : 0.0f;
+                float br_deg = BR_WheelLegs_ ? BR_WheelLegs_->Get_LegAngleWrapped() : 0.0f;
+                climbing_.manualTriggerBackPair(bl_deg, br_deg);
+            }
+        }
+        climb_last_buttons_ = cmd.button_status;
+    }
+
     // --- Trigger-based DIRECT ANGLE debug (verify climbing direction) ---
     // L trigger → FL/FR sweep from -(180-deadzone) toward 0° (climbing direction)
     // R trigger → BL/BR sweep from +(180-deadzone) toward 0° (climbing direction)
@@ -1663,20 +1686,170 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
         float grav_static = climb_ffw_load_per_leg * GRAVITY_g * climb_r_m * sinf(theta_rad);
         tres[i] = legs_climb[i]->Get_LegTorqueFeedback() - grav_static;
     }
-    if (FL_WheelLegs_)
-        fb[0] = {FL_WheelLegs_->Get_LegAngleWrapped(), FL_WheelLegs_->Get_WheelRPM(), tres[0], FL_WheelLegs_->Get_LegVelocity()};
-    if (FR_WheelLegs_)
-        fb[1] = {FR_WheelLegs_->Get_LegAngleWrapped(), FR_WheelLegs_->Get_WheelRPM(), tres[1], FR_WheelLegs_->Get_LegVelocity()};
-    if (BL_WheelLegs_)
-        fb[2] = {BL_WheelLegs_->Get_LegAngleWrapped(), BL_WheelLegs_->Get_WheelRPM(), tres[2], BL_WheelLegs_->Get_LegVelocity()};
-    if (BR_WheelLegs_)
-        fb[3] = {BR_WheelLegs_->Get_LegAngleWrapped(), BR_WheelLegs_->Get_WheelRPM(), tres[3], BR_WheelLegs_->Get_LegVelocity()};
+    // A4ag/A4ah: DEBOUNCED wheel-stall flag. Raw condition: user commanding
+    // forward (left-stick past deadzone) AND wheel not rolling (|RPM| <
+    // threshold). But the raw condition is TRUE for the first few ticks of
+    // any forward push -- the wheel motor hasn't spun up yet (RPM still ~0).
+    // Treating that startup transient as a stall would FALSE-TRIGGER climb
+    // the instant the user pushes. So require the raw condition to PERSIST
+    // for WHEEL_STALL_CONFIRM_S: a genuine stall (jammed at step) holds the
+    // wheel at ~0 indefinitely; a spin-up transient clears within ~0.1 s
+    // once the wheel starts rolling, resetting the timer.
+    bool user_pushing_fwd = (cmd.left_joystick.r_x1000_msg > 200);
+    // A4am: STATE-MACHINE wheel-stall detection.
+    //
+    // The simple "user pushing + low RPM" debounce (A4ag/A4ah/A4ak) fails at
+    // startup: when the chassis is heavy and the user pushes from rest, the
+    // wheel motor pulls high current to accelerate but takes 0.3-0.8 s to
+    // cross the stall RPM threshold -- in that window the "raw stall" is
+    // continuously true, and even a 0.2 s confirm fires falsely. User
+    // observed: "起步很慢并且有大扭矩 直接判断堵转, 一动就直接 climb 了".
+    //
+    // Fix: per-leg "was_rolling" flag. The wheel must FIRST cross
+    // WHEEL_ROLLING_RPM (= clearly rolling) before stall judgment is enabled.
+    // - Spin-up from rest: RPM rising 0->target, never crossed ROLLING ->
+    //   was_rolling = false -> stall judgment OFF -> no false trigger.
+    // - Wheel rolled normally then hit step: RPM crossed ROLLING (= true)
+    //   then dropped < STALL -> stall timer accumulates -> trigger.
+    // Reset on joystick release (robot stopped, new attempt resets state).
+    // A4an: split stall RPM threshold front vs back.
+    //   Front (FL/FR): HT motor fully BRAKES against the step face -> the
+    //     front wheel reaches near-0 RPM cleanly when blocked. Tight 5 RPM
+    //     threshold detects this strict stall.
+    //   Back (BL/BR): wheel decelerates from rolling but doesn't fully stop
+    //     (edge friction/scrape, not face-jam). User observation: "BL BR
+    //     climb 时会有减速现象，但不会堵转为 0". A higher 15 RPM threshold
+    //     catches "rolling -> slowed past 15" as a stall, even if the
+    //     wheel keeps slow-slipping at 5-12 RPM.
+    // ROLLING threshold (25, common) is the was_rolling latch -- the wheel
+    // must first spin clearly fast before stall judgment is enabled (so
+    // heavy-load spin-up from rest doesn't false-trigger).
+    constexpr float WHEEL_ROLLING_RPM       = 25.0f;
+    constexpr float WHEEL_STALL_RPM_FRONT   = 5.0f;
+    constexpr float WHEEL_STALL_RPM_BACK    = 15.0f;
+    constexpr float WHEEL_STALL_CONFIRM_S   = 0.20f;
+    // A4ao: VELOCITY RESIDUAL path (mirror of torque residual).
+    //   The wheel RPM has its own LPF baseline (slow ~1.6 Hz). When the
+    //   wheel suddenly decelerates (e.g. hits step edge), baseline lags
+    //   the actual rpm and the "drop" = (baseline - rpm) reveals the
+    //   deceleration EVENT, even if the wheel doesn't stop completely
+    //   (catches "decelerated from 30 -> 12 RPM" which absolute stall at
+    //   < 15 might only barely catch, and at < 5 wouldn't catch at all).
+    //   Per user HW: BL/BR decelerates but doesn't reach 0 -- exactly the
+    //   case this path handles. Combined OR with abs_stall in raw_stall.
+    constexpr float WHEEL_RPM_LPF_ALPHA   = 0.02f;  // ~1.6 Hz tau ~ 100 ms
+    // A4ap: drop threshold raised 10 -> 25 RPM after A4ao false-triggered
+    // on normal joystick push variation (user squeezes/releases gently ->
+    // wheel rpm wobbles 10-15 RPM -> false climb trigger). 25 RPM drop
+    // requires a substantial deceleration event (e.g. wheel really jamming
+    // at step), not normal speed variation.
+    constexpr float WHEEL_DECEL_THRESHOLD = 25.0f;
+    Wheel_Leg *legs_stall[4] = {FL_WheelLegs_, FR_WheelLegs_, BL_WheelLegs_, BR_WheelLegs_};
+    bool wheel_blocked_arr[4] = {false, false, false, false};
+    for (int i = 0; i < 4; i++)
+    {
+        if (!legs_stall[i])
+            continue;
+        float rpm_abs = fabsf(legs_stall[i]->Get_WheelRPM());
 
-    climbing_.config().step_height_m              = dbg_ctrl.step_height_mm / 1000.0f;
-    climbing_.config().torque_res_threshold       = dbg_ctrl.torque_res_threshold;
-    climbing_.config().climb_omega                = dbg_ctrl.climb_omega;
-    climbing_.config().back_detect_hold_offset_deg = dbg_ctrl.climb_back_lift_offset_deg;
+        // A4ao: LPF baseline of wheel RPM. Slow tracking (~1.6 Hz) so that
+        // a sudden deceleration creates a large transient `drop`.
+        wheel_rpm_baseline_[i] = WHEEL_RPM_LPF_ALPHA * rpm_abs +
+                                 (1.0f - WHEEL_RPM_LPF_ALPHA) * wheel_rpm_baseline_[i];
+
+        // Latch "was rolling" once the wheel actually spins (A4am).
+        if (rpm_abs > WHEEL_ROLLING_RPM)
+            wheel_was_rolling_[i] = true;
+
+        // Joystick release -> robot stopped -> reset stall state for next attempt.
+        if (!user_pushing_fwd)
+        {
+            wheel_was_rolling_[i]    = false;
+            wheel_stall_timer_[i]    = 0.0f;
+            wheel_rpm_baseline_[i]   = rpm_abs;  // fresh baseline on next push
+        }
+
+        // Per-leg stall threshold: front strict, back relaxed (A4an).
+        float stall_thresh = (i < 2) ? WHEEL_STALL_RPM_FRONT : WHEEL_STALL_RPM_BACK;
+        bool abs_stall    = (rpm_abs < stall_thresh);
+
+        // A4aq: wheel_blocked now ONLY = abs_stall (with was_rolling). The
+        // velocity-residual path moved to Climbing_Dynamics as part of the
+        // sum-of-scores combined detection (avoids double-counting the
+        // wheel drop signal in both Chassis OR and the combined score).
+        // The wheel_rpm_baseline_ still tracks here -- we publish the
+        // drop value via feedback for Climbing_Dynamics to use.
+        bool raw_stall = user_pushing_fwd && wheel_was_rolling_[i] && abs_stall;
+        if (raw_stall)
+            wheel_stall_timer_[i] += 0.002f;  // 500 Hz tick
+        else
+            wheel_stall_timer_[i] = 0.0f;
+        wheel_blocked_arr[i] = (wheel_stall_timer_[i] > WHEEL_STALL_CONFIRM_S);
+    }
+    // A4aq: compute wheel_drop per leg = baseline - |rpm| (positive when
+    // wheel decelerates below its smoothed baseline). Pass to
+    // Climbing_Dynamics for the combined sum-of-scores detection.
+    auto compute_wheel_drop = [&](int idx) -> float {
+        if (!legs_stall[idx]) return 0.0f;
+        float rpm_abs_local = fabsf(legs_stall[idx]->Get_WheelRPM());
+        float d = wheel_rpm_baseline_[idx] - rpm_abs_local;
+        return (d > 0.0f) ? d : 0.0f;  // only report positive drops (decel)
+    };
+    if (FL_WheelLegs_)
+        fb[0] = {FL_WheelLegs_->Get_LegAngleWrapped(), FL_WheelLegs_->Get_WheelRPM(), tres[0], FL_WheelLegs_->Get_LegVelocity(), wheel_blocked_arr[0], compute_wheel_drop(0)};
+    if (FR_WheelLegs_)
+        fb[1] = {FR_WheelLegs_->Get_LegAngleWrapped(), FR_WheelLegs_->Get_WheelRPM(), tres[1], FR_WheelLegs_->Get_LegVelocity(), wheel_blocked_arr[1], compute_wheel_drop(1)};
+    if (BL_WheelLegs_)
+        fb[2] = {BL_WheelLegs_->Get_LegAngleWrapped(), BL_WheelLegs_->Get_WheelRPM(), tres[2], BL_WheelLegs_->Get_LegVelocity(), wheel_blocked_arr[2], compute_wheel_drop(2)};
+    if (BR_WheelLegs_)
+        fb[3] = {BR_WheelLegs_->Get_LegAngleWrapped(), BR_WheelLegs_->Get_WheelRPM(), tres[3], BR_WheelLegs_->Get_LegVelocity(), wheel_blocked_arr[3], compute_wheel_drop(3)};
+
+    // A4ao: publish velocity-residual diagnostics for Ozone plot.
+    for (int k = 0; k < 4; k++)
+    {
+        dbg_climb_plot.wheel_rpm_baseline[k] = wheel_rpm_baseline_[k];
+        if (legs_stall[k])
+            dbg_climb_plot.wheel_rpm_drop[k] = wheel_rpm_baseline_[k] - fabsf(legs_stall[k]->Get_WheelRPM());
+    }
+
+    // A4as: publish detection diagnostic scores. These are populated by
+    // Climbing_Dynamics in DETECT case; zero outside DETECT. With a leg in
+    // DETECT, plot these alongside wheel_rpm_drop to see end-to-end signal
+    // path and identify which gate (front_gate / back_settle / turning /
+    // warmup) is blocking trigger when combined_score >= 1 but detect_allowed
+    // = 0.
+    for (int k = 0; k < 4; k++)
+    {
+        float ts = climbing_.getTorqueScore(k);
+        float ws = climbing_.getWheelScore(k);
+        dbg_climb_plot.t_score[k]        = ts;
+        dbg_climb_plot.w_score[k]        = ws;
+        dbg_climb_plot.combined_score[k] = ts + ws;
+        dbg_climb_plot.detect_allowed[k] = climbing_.getDetectAllowed(k) ? 1 : 0;
+        dbg_climb_plot.detect_timer_s[k] = climbing_.getDetectTimer(k);
+    }
+
+    climbing_.config().step_height_m                = dbg_ctrl.step_height_mm / 1000.0f;
+    climbing_.config().torque_res_threshold         = dbg_ctrl.torque_res_threshold;       // front
+    climbing_.config().torque_res_threshold_back    = dbg_ctrl.torque_res_threshold_back;  // A4al back
+    climbing_.config().climb_omega                  = dbg_ctrl.climb_omega;
+    climbing_.config().back_detect_hold_offset_deg  = dbg_ctrl.climb_back_lift_offset_deg;
     const float dt                          = 0.002f;
+
+    // A4ad: inhibit step detection while turning. Read the RAW right-stick
+    // (rotation) magnitude directly from the joystick -- NOT via
+    // Map_Joystick_To_Velocity, which has a stateful slew limiter that must
+    // be called exactly once per tick (the wheel block below owns that call).
+    // A yaw maneuver differentially loads the eccentric legs and fakes a
+    // step-contact torque residual, so detection is suppressed whenever the
+    // operator is steering. r_x1000_msg is 0..1000 stick magnitude; the
+    // controller deadzone is 200, so 200 here matches "any real turn input".
+    {
+        constexpr uint16_t DETECT_TURN_INHIBIT_R = 200;  // right-stick magnitude deadzone
+        bool turning = (cmd.right_joystick.r_x1000_msg > DETECT_TURN_INHIBIT_R);
+        climbing_.setDetectInhibit(turning);
+        dbg_climb_plot.detect_inhibited = turning ? 1 : 0;
+    }
 
     climbing_.update(fb, dt);
 
@@ -1902,6 +2075,103 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
 
     Wheel_Leg *legs[4]     = {FL_WheelLegs_, FR_WheelLegs_, BL_WheelLegs_, BR_WheelLegs_};
     float dbg_angle_cmd[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // A4aw: update FL/FR dtheta authority ramp once per tick (before the
+    // per-leg loop). The authority [0..1] multiplies FL/FR's body-PID
+    // dtheta. Target = 0 while BL/BR is in CLIMBING (kill the up-down
+    // jerk from PID chasing the dynamic chassis pitch during back climb);
+    // target = 1 otherwise (full PID leveling for static poses).
+    // Smoothstep timer-based transition (matches the gentle-ramp pattern
+    // user is comfortable with from PREP), tunable via climb_dtheta_ramp_s.
+    {
+        bool back_any_climbing = (climbing_.getPhase(2) == LegClimbPhase::CLIMBING ||
+                                  climbing_.getPhase(3) == LegClimbPhase::CLIMBING);
+        float new_target = back_any_climbing ? 0.0f : 1.0f;
+        if (fabsf(new_target - climb_dtheta_authority_target_) > 0.01f)
+        {
+            // Rising/falling edge: start a fresh smoothstep transition
+            // from the CURRENT authority value (catches the "interrupt
+            // mid-ramp" case where back exits CLIMBING before authority
+            // reached 0 -- ramp restarts back to 1 from wherever it was).
+            climb_dtheta_authority_start_  = climb_dtheta_authority_;
+            climb_dtheta_authority_target_ = new_target;
+            climb_dtheta_authority_t_      = 0.0f;
+        }
+        const float dt_aw    = 0.002f;
+        const float ramp_s   = (dbg_ctrl.climb_dtheta_ramp_s > 1e-3f) ? dbg_ctrl.climb_dtheta_ramp_s : 1e-3f;
+        climb_dtheta_authority_t_ += dt_aw;
+        float alpha_aw = climb_dtheta_authority_t_ / ramp_s;
+        if (alpha_aw > 1.0f) alpha_aw = 1.0f;
+        float s_aw = alpha_aw * alpha_aw * (3.0f - 2.0f * alpha_aw);  // smoothstep
+        climb_dtheta_authority_ = climb_dtheta_authority_start_ +
+                                  (climb_dtheta_authority_target_ - climb_dtheta_authority_start_) * s_aw;
+    }
+
+    // A4ax: per-leg smoothstep authorities for (a) the COMPLETE-phase
+    // PID gate, and (b) the direct angle offsets (front_drop / back_extend).
+    // Both eliminate the binary-snap symptoms user reported after A4aw:
+    // FL/FR "突然变矮 再突然变高" was front_drop applying/releasing as a
+    // step; "类似调整pitch一样的瞬间响应" was phase_gate jumping 0->1 on
+    // COMPLETE entry, letting body-PID dtheta hit the leg as an impulse.
+    {
+        bool front_all_complete = (climbing_.getPhase(0) == LegClimbPhase::COMPLETE &&
+                                   climbing_.getPhase(1) == LegClimbPhase::COMPLETE);
+        bool back_all_complete  = (climbing_.getPhase(2) == LegClimbPhase::COMPLETE &&
+                                   climbing_.getPhase(3) == LegClimbPhase::COMPLETE);
+        const float dt_x   = 0.002f;
+        const float ramp_x = (dbg_ctrl.climb_dtheta_ramp_s > 1e-3f) ? dbg_ctrl.climb_dtheta_ramp_s : 1e-3f;
+        for (int j = 0; j < 4; j++)
+        {
+            LegClimbPhase ph_j = climbing_.getPhase(j);
+
+            // Phase-complete authority: target=1 when leg in COMPLETE, else 0.
+            float pc_target = (ph_j == LegClimbPhase::COMPLETE) ? 1.0f : 0.0f;
+            if (fabsf(pc_target - phase_complete_authority_target_[j]) > 0.01f)
+            {
+                phase_complete_authority_start_[j]  = phase_complete_authority_[j];
+                phase_complete_authority_target_[j] = pc_target;
+                phase_complete_authority_t_[j]      = 0.0f;
+            }
+            phase_complete_authority_t_[j] += dt_x;
+            float a_pc = phase_complete_authority_t_[j] / ramp_x;
+            if (a_pc > 1.0f) a_pc = 1.0f;
+            float s_pc = a_pc * a_pc * (3.0f - 2.0f * a_pc);
+            phase_complete_authority_[j] = phase_complete_authority_start_[j] +
+                                           (phase_complete_authority_target_[j] - phase_complete_authority_start_[j]) * s_pc;
+
+            // Leg-offset authority: target=1 when the front_drop or
+            // back_extend offset should apply. Front (i<2): leg COMPLETE
+            // && back not done. Back (i>=2): front both COMPLETE && leg
+            // in DETECT/CLIMBING/COMPLETE && back not done.
+            float lo_target = 0.0f;
+            if (j < 2)
+            {
+                if (ph_j == LegClimbPhase::COMPLETE && !back_all_complete)
+                    lo_target = 1.0f;
+            }
+            else
+            {
+                bool back_in_active = (ph_j == LegClimbPhase::DETECT ||
+                                       ph_j == LegClimbPhase::CLIMBING ||
+                                       ph_j == LegClimbPhase::COMPLETE);
+                if (front_all_complete && back_in_active && !back_all_complete)
+                    lo_target = 1.0f;
+            }
+            if (fabsf(lo_target - leg_offset_authority_target_[j]) > 0.01f)
+            {
+                leg_offset_authority_start_[j]  = leg_offset_authority_[j];
+                leg_offset_authority_target_[j] = lo_target;
+                leg_offset_authority_t_[j]      = 0.0f;
+            }
+            leg_offset_authority_t_[j] += dt_x;
+            float a_lo = leg_offset_authority_t_[j] / ramp_x;
+            if (a_lo > 1.0f) a_lo = 1.0f;
+            float s_lo = a_lo * a_lo * (3.0f - 2.0f * a_lo);
+            leg_offset_authority_[j] = leg_offset_authority_start_[j] +
+                                       (leg_offset_authority_target_[j] - leg_offset_authority_start_[j]) * s_lo;
+        }
+    }
+
     for (int i = 0; i < 4; i++)
     {
         if (!legs[i])
@@ -1967,8 +2237,33 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
             // Without this gate, PID dtheta of -5 deg on BL/BR during DETECT
             // generates continuous Kp*err output -> false residual spikes ->
             // BL/BR false-trigger DETECT->CLIMBING before FL/FR actually contact.
+            // A4ae: PID dtheta applied ONLY in COMPLETE phase.
+            //   - PREP / DETECT: gated off (clean lift + clean detection).
+            //   - CLIMBING: gated off too -- the trajectory IS the leg
+            //     command during climb; adding a +10deg nose-up dtheta
+            //     would FIGHT the climbing motion (climb drives theta DOWN
+            //     165->62, pitch dtheta pushes it back UP). So no pitch
+            //     during the active pivot.
+            //   - COMPLETE: applied. This is the post-front nose-down
+            //     (CoM-forward) phase. Front legs are at ~62deg (end-climb)
+            //     where sin(theta) is large (0.88) -> good pitch authority,
+            //     and far from the seam -> the larger +/-15deg clamp below
+            //     is safe. Lowering the front legs tilts the chassis
+            //     nose-down to shift CoM forward for the back climb.
             LegClimbPhase ph_i_gate = climbing_.getPhase(i);
-            float phase_gate        = (ph_i_gate == LegClimbPhase::CLIMBING || ph_i_gate == LegClimbPhase::COMPLETE) ? 1.0f : 0.0f;
+            // A4ax: smoothstep-ramped COMPLETE-phase gate (replaces the
+            // binary A4uu gate). authority is 0 outside COMPLETE, ramps
+            // 0->1 on COMPLETE entry over climb_dtheta_ramp_s. Eliminates
+            // the dtheta impulse that hit the leg as PID went live at
+            // CLIMBING->COMPLETE transition ("类似调整pitch一样的瞬间响应").
+            float phase_gate = phase_complete_authority_[i];
+            // A4aw: multiply FL/FR's gate by the smoothstep authority that
+            // ramps 1->0 while BL/BR is in CLIMBING (kills PID-driven jerk
+            // during the dynamic back-climb window). BL/BR's gate is not
+            // affected: their CLIMBING/DETECT phase already zeros phase_gate
+            // via the phase_complete_authority above.
+            if (i < 2)
+                phase_gate *= climb_dtheta_authority_;
             float dh = lev_scale * BODY_PID_SCALE_PITCH * lev_signs[i][0] * pitch_h_adj * phase_gate;
             float dtheta_deg = dh / r_m * (180.0f / 3.14159265f);
             // Clamp +/- 5 deg: well below the 15 deg new_theta-boundary
@@ -1981,10 +2276,17 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
             // an order of magnitude smaller than the gravity FFW (~15 Nm
             // at theta=90) -- so PID leveling is a true MICRO-adjustment
             // on top of FFW's static balance, not a competing controller.
-            if (dtheta_deg > 5.0f)
-                dtheta_deg = 5.0f;
-            if (dtheta_deg < -5.0f)
-                dtheta_deg = -5.0f;
+            // A4ae: clamp raised +/-5 -> +/-15 deg. Now that dtheta only
+            // applies in COMPLETE (legs at ~62deg, far from seam), a larger
+            // swing is safe (new_theta clamp [15,165] still catches it) and
+            // gives meaningful pitch authority: at 62deg, 15deg of front-leg
+            // lowering -> ~15mm chassis drop -> ~3deg nose-down (vs the ~1deg
+            // the old +/-5 clamp produced -- user saw "+-1deg basically no
+            // change"). Tune via the dtheta clamp if more/less tilt wanted.
+            if (dtheta_deg > 15.0f)
+                dtheta_deg = 15.0f;
+            if (dtheta_deg < -15.0f)
+                dtheta_deg = -15.0f;
             float new_theta = theta_unsigned + dtheta_deg;
             // Clamp the commanded motor angle to [prep_margin, 180-prep_margin]
             // = [15, 165] by default. Two things this guards against:
@@ -2019,6 +2321,61 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
                 new_theta = upper_clamp;
             if (new_theta < prep_margin)
                 new_theta = prep_margin;
+
+            // A4af: DIRECT front-leg drop to shift CoM forward for the back
+            // climb. After FL/FR reach COMPLETE (front wheels on the step),
+            // the chassis tends to sit back-heavy ("重心全压在后轮") and the
+            // back wheels can't pivot up. Lowering the FRONT legs by a fixed
+            // angle drops the chassis front -> nose-down -> CoM shifts
+            // forward -> back wheels unloaded. This is the EFFECTIVE
+            // mechanism (front legs at ~62deg have strong geometric
+            // authority, 1.08 mm/deg) vs. the near-useless back-leg
+            // extension at 165deg (0.32 mm/deg). It's a DIRECT, visible
+            // angle command (not the weak attenuated body-PID dtheta), so
+            // climb_front_drop_deg degrees of front lowering reliably
+            // produces the tilt. Only while back legs still need to climb;
+            // once back legs COMPLETE too, the drop is released (climb done).
+            // A4ax: front_drop now multiplied by leg_offset_authority_[i]
+            // (smoothstep 0..1). The previous binary application snapped
+            // the leg by climb_front_drop_deg (~15 deg) on COMPLETE entry
+            // and again on back-COMPLETE release -- "突然变矮 再突然变高".
+            // Authority handles BOTH transitions: ramps 0->1 over
+            // climb_dtheta_ramp_s when activation conditions become true,
+            // ramps 1->0 over the same window when they become false.
+            {
+                bool is_front_leg = (i < 2);
+                if (is_front_leg)
+                {
+                    new_theta -= dbg_ctrl.climb_front_drop_deg * leg_offset_authority_[i];
+                    if (new_theta < prep_margin)
+                        new_theta = prep_margin;
+                }
+            }
+            // A4av (mechanism) + A4ax (smoothing): BL/BR DIRECT angle
+            // extend, multiplied by leg_offset_authority_[i] so the
+            // offset eases in/out over climb_dtheta_ramp_s (no snap).
+            // Sign convention (per A4av):
+            //   > 0  motor angle larger -> back leg extends -> back of
+            //        chassis rises -> nose-down -> CoM forward -> back
+            //        wheels unloaded (less weight, less grip)
+            //   < 0  motor angle smaller -> back leg shortens -> back of
+            //        chassis drops -> nose-up -> CoM backward -> back
+            //        wheels loaded (more weight, more grip)
+            // For CLIMBING phase the offset rides on top of the kinematic
+            // trajectory -- accept small deviation from the pure beta-
+            // pivot path in exchange for the chassis pose adjustment.
+            {
+                bool is_back_leg = (i >= 2);
+                if (is_back_leg)
+                {
+                    new_theta += dbg_ctrl.climb_back_extend_deg * leg_offset_authority_[i];
+                    // Re-clamp against the upper_clamp computed earlier
+                    // (175 for back during this window, 5 deg seam margin)
+                    // and prep_margin (15 deg).
+                    if (new_theta > upper_clamp) new_theta = upper_clamp;
+                    if (new_theta < prep_margin) new_theta = prep_margin;
+                }
+            }
             float angle_cmd = climb_sign[i] * new_theta;
 
             // Body-mass-aware sin-based gravity FFW. Uses ADAPTIVE load
@@ -2092,8 +2449,16 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
                 case LegClimbPhase::CLIMBING:
                 case LegClimbPhase::COMPLETE:
                 default:
-                    CLIMB_PD_KP = 80.0f;
-                    CLIMB_PD_KD = 4.0f;
+                    // A4aq: raised 80 -> 200 to match DETECT stiffness. The
+                    // wheel motor's reaction torque through the eccentric
+                    // coupling was overwhelming Kp=80 (or 120), pushing the
+                    // leg past its trajectory target -> dangerous snap-back.
+                    // 200 holds the leg firmly on trajectory regardless of
+                    // wheel coupling. omega_ff (matched trajectory derivative)
+                    // keeps Kd from fighting commanded motion, so Kp=200
+                    // doesn't make tracking feel stiff.
+                    CLIMB_PD_KP = 200.0f;
+                    CLIMB_PD_KD = 5.0f;
                     break;
             }
             constexpr float CLIMB_PD_TAU_MAX = 200.0f;
@@ -2160,6 +2525,7 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
         LegClimbPhase ph_k                     = climbing_.getPhase(k);
         dbg_climb_plot.phase[k]                = static_cast<uint8_t>(ph_k);
         dbg_climb_plot.beta_rad[k]             = climbing_.getBeta(k);
+        dbg_climb_plot.wheel_blocked[k]        = fb[k].wheel_blocked ? 1 : 0;
         dbg_climb_plot.residual_baseline_nm[k] = climbing_.getBaseline(k);
         // Threshold-compare deviation (matches the value Climbing_Dynamics tests).
         float dev_k                            = fabsf(dbg_climb_plot.residual_nm[k] - climbing_.getBaseline(k));
@@ -2175,7 +2541,8 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
             residual_peak_[k] = dev_k;
         dbg_climb_plot.residual_peak_nm[k] = residual_peak_[k];
     }
-    dbg_climb_plot.torque_res_threshold_nm = climbing_.config().torque_res_threshold;
+    dbg_climb_plot.torque_res_threshold_nm      = climbing_.config().torque_res_threshold;
+    dbg_climb_plot.torque_res_threshold_back_nm = climbing_.config().torque_res_threshold_back;
     dbg_climb_plot.beta0_rad              = climbing_.getBeta0();
     // pitch_setpoint_raw_deg / pitch_setpoint_filt_deg already populated
     // earlier in A4tt phase-bias block; only fill the remaining IMU + PID
@@ -2224,6 +2591,51 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
 
     float wheel_rpms[4], vx = 0.0f, wz = 0.0f;
     controller_.Map_Joystick_To_Velocity(cmd, vx, wz);
+
+    // A4ai: AUTO CHASSIS-ADVANCE during CLIMBING.
+    //
+    // The user reported: BL/BR triggers (phase=CLIMBING) but "爬不动" --
+    // back legs run the trajectory but the wheel doesn't climb. Most
+    // likely cause: the chassis can't move forward.
+    //
+    // Physics: for the BACK wheel to pivot up the step, the chassis MUST
+    // advance forward (geometric requirement of the pivot trajectory).
+    // The chassis advance requires the FRONT wheels (on the step surface)
+    // to roll forward. But HT wheel motors BRAKE when commanded 0 RPM --
+    // if the user isn't pushing the joystick hard enough during the back
+    // climb, the front wheels stay locked, the chassis can't advance, and
+    // the back leg motor stalls (commanded to rotate but the chassis is
+    // pinned). Result: back climb FAILS even though the trajectory is
+    // running. The front climb didn't have this issue because the back
+    // wheels were on flat ground and could skid/drag.
+    //
+    // Fix: drive ALL wheels forward automatically during CLIMBING at the
+    // KINEMATIC chassis-advance rate (cos(beta) * phi_w), so the chassis
+    // advances independently of user push. phi_w is smoothstep-ramped
+    // (A4ww), so the drive ramps in smoothly -- no surge like the old
+    // climb_base_rpm (removed in A4ll). climb_advance_scale > 1.0 adds a
+    // grip margin so the climbing wheel is also pushed against the step
+    // edge to help it climb.
+    {
+        float climb_adv_rpm = 0.0f;
+        for (int k = 0; k < 4; k++)
+        {
+            if (climbing_.getPhase(k) == LegClimbPhase::CLIMBING)
+            {
+                float phi_w_k = climbing_.getEffectivePhiW(k);
+                float beta_k  = climbing_.getBeta(k);
+                // chassis-advance wheel angular velocity = cos(beta) * phi_w
+                float adv_k   = fabsf(cosf(beta_k)) * phi_w_k *
+                                (60.0f / (2.0f * 3.14159265f)) *
+                                dbg_ctrl.climb_advance_scale;
+                if (adv_k > climb_adv_rpm)
+                    climb_adv_rpm = adv_k;
+            }
+        }
+        vx += climb_adv_rpm;  // add forward drive; cap below limits total
+        dbg_climb_plot.climb_advance_rpm = climb_adv_rpm;
+    }
+
     inverseKinematics(vx, 0, wz, wheel_rpms);
 
     // A4xx: wheel speed cap during CLIMBING.
@@ -2250,13 +2662,11 @@ void Chassis::handleClimbingMode(const Protocol::PC_Msg &cmd)
     // over-cap as beta grows, which still permits chassis-matching
     // motion (margin shrinks but never goes negative since beta < pi/2).
     // SAFETY ceiling on wheel RPM during CLIMBING regardless of how the user
-    // tunes climb_omega / climb_wheel_speed_ratio. 25 RPM corresponds to
-    // 25 * 2pi/60 * R = 0.26 m/s wheel surface velocity = 26 cm/s -- about
-    // 1/4 of normal walking pace. Even at this absolute max the chassis can
-    // never lurch forward beyond a slow walk, so passenger safety holds
-    // regardless of mis-tuning the inner ratios. Lower this if you want a
-    // tighter safety envelope.
-    constexpr float CLIMB_ABSOLUTE_MAX_WHEEL_RPM = 25.0f;
+    // tunes climb_omega / climb_wheel_speed_ratio.
+    //   A4aq: kept at 40 RPM per user feedback. Safety addressed via
+    //   raising CLIMBING Kp to 200 (resists wheel-coupling deflection)
+    //   rather than throttling the wheel.
+    constexpr float CLIMB_ABSOLUTE_MAX_WHEEL_RPM = 40.0f;
     float climb_max_rpm = 1.0e9f;  // effectively no cap unless overridden below
     for (int i = 0; i < 4; i++)
     {

@@ -29,6 +29,8 @@ struct LegClimbFeedback
     float wheel_rpm;            // Wheel motor RPM
     float leg_torque_residual;  // Leg torque - gravity comp (Nm) — step detection
     float leg_vel_radps;        // Leg angular velocity (rad/s) — detection settle gate
+    bool  wheel_blocked;        // A4ag: user commanding forward but wheel RPM~0 -> blocked by step (abs stall)
+    float wheel_drop;           // A4aq: wheel_rpm_baseline - |wheel_rpm| in RPM (positive = wheel decelerated below baseline)
 };
 
 /**
@@ -85,9 +87,26 @@ class Climbing_Dynamics
         float prep_ramp_s = 3.0f;
 
         // --- Step detection (leg torque residual) ---
-        float torque_res_threshold = 4.0f;    // |residual - baseline| to trigger (Nm)
-        float baseline_alpha       = 0.02f;   // LPF rate for baseline (~1.6 Hz @ 500 Hz)
-        float detect_confirm_s     = 0.020f;  // Confirmation duration (s)
+        // A4al: separate thresholds for front (FL/FR) and back (BL/BR).
+        // Physics: front wheels hit the step face directly -> sharp clean
+        // torque spike. Back wheels often skim/scrape the edge during
+        // approach (chassis tilted from A4af, weight transfer in progress)
+        // -> weaker, noisier signal. So the back typically needs a LOWER
+        // threshold than the front. `torque_res_threshold` (un-suffixed)
+        // remains the FRONT value (legacy name, no Ozone watch breakage).
+        float torque_res_threshold      = 4.0f;  // FRONT legs (FL/FR), Nm
+        float torque_res_threshold_back = 2.5f;  // BACK  legs (BL/BR), Nm -- lower default
+        // A4aq: per-leg wheel-velocity drop threshold (mirror of torque
+        // residual threshold split). Used by the combined sum-of-scores
+        // detection: w_score = wheel_drop / wheel_drop_threshold.
+        // Front wheels stall fully so wheel_blocked (abs stall) usually
+        // catches them; this threshold is set higher (less sensitive).
+        // Back wheels decelerate but don't stop -- lower threshold so the
+        // observed deceleration contributes to detection.
+        float wheel_drop_threshold      = 25.0f; // FRONT, RPM drop
+        float wheel_drop_threshold_back = 12.0f; // BACK, RPM drop -- "速度骤降很明显"
+        float baseline_alpha            = 0.02f;   // LPF rate for baseline (~1.6 Hz @ 500 Hz)
+        float detect_confirm_s          = 0.020f;  // Confirmation duration (s)
         // Detection is only valid while the leg is (nearly) stationary: the
         // closed-loop drive torque during motion shows up in the torque residual
         // and would false-trigger CLIMBING. Gate on leg speed below this.
@@ -287,6 +306,12 @@ class Climbing_Dynamics
     float computeBetaFromTheta(float theta_rad) const;
     float heightFromTheta(float theta_rad) const;
 
+    // A4ae: transition one leg DETECT->CLIMBING, seeding beta from its current
+    // motor angle. Used by the coupled-pair trigger (one leg confirming
+    // contact starts both legs of its front/back pair). No-op if the leg
+    // isn't currently in DETECT.
+    void beginClimbing(int idx, float current_motor_deg);
+
     Config cfg_;
     LegState legs_[4];
     float target_h_[4]         = {0};
@@ -300,10 +325,51 @@ class Climbing_Dynamics
     // not both COMPLETE, BL/BR cannot enter CLIMBING.
     float back_settle_remaining_s_ = 0.0f;
     bool  front_was_complete_      = false;
+    bool  detect_inhibit_          = false;  // A4ad: set by Chassis during turning; suppresses all detection
+
+    // A4as: per-leg detection diagnostic snapshot (updated in DETECT case).
+    // Plotted via Ozone so user can see WHICH detection gate is currently
+    // blocking trigger: if t_score+w_score>=1 but detect_allowed=false, a
+    // gate (front_gate / back_settle / turning_inhibit / warmup) is closed.
+    float per_leg_t_score_[4]          = {0.0f, 0.0f, 0.0f, 0.0f};
+    float per_leg_w_score_[4]          = {0.0f, 0.0f, 0.0f, 0.0f};
+    bool  per_leg_detect_allowed_[4]   = {false, false, false, false};
 
    public:
     /** Remaining seconds in the post-front-CLIMBING back-detect delay (A4yy). 0 = window expired. */
     float getBackSettleRemaining() const { return back_settle_remaining_s_; }
+
+    /** A4as: per-leg detection diagnostics for Ozone plotting. */
+    float getTorqueScore(int idx) const { return (idx >= 0 && idx < 4) ? per_leg_t_score_[idx] : 0.0f; }
+    float getWheelScore (int idx) const { return (idx >= 0 && idx < 4) ? per_leg_w_score_[idx] : 0.0f; }
+    bool  getDetectAllowed(int idx) const { return (idx >= 0 && idx < 4) ? per_leg_detect_allowed_[idx] : false; }
+    float getDetectTimer(int idx) const { return (idx >= 0 && idx < 4) ? legs_[idx].detect_timer_s : 0.0f; }
+
+    /**
+     * A4ar: MANUAL back-pair trigger. Used by Chassis when the operator
+     * presses BTN_X a second time during ACTIVE. Bypasses all DETECT
+     * gates (residual / wheel-stall / back_settle / detect_inhibit) --
+     * the operator has positioned the back wheels and explicitly commands
+     * climb. Only fires legs currently in DETECT (no-op for legs already
+     * climbing or still in PREP). Caller should verify front-pair is
+     * COMPLETE before calling (this method itself doesn't enforce it).
+     */
+    void manualTriggerBackPair(float bl_motor_deg, float br_motor_deg)
+    {
+        beginClimbing(2, bl_motor_deg);
+        beginClimbing(3, br_motor_deg);
+    }
+
+    /**
+     * A4ad: external detection inhibit. When set true, ALL step-contact
+     * detection (DETECT->CLIMBING) is suppressed. Chassis sets this while
+     * the robot is TURNING -- differential wheel loading during a yaw
+     * maneuver pushes the eccentric leg sideways and shows up as a torque
+     * residual that mimics step contact (the "step 3" false-trigger source).
+     * Detection should only proceed while driving straight & gently.
+     */
+    void setDetectInhibit(bool inhibit) { detect_inhibit_ = inhibit; }
+    bool getDetectInhibit() const { return detect_inhibit_; }
 };
 
 }  // namespace Applications

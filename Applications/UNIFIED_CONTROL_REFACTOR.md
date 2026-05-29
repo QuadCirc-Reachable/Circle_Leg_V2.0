@@ -7,6 +7,101 @@
 
 ---
 
+## 0. CLIMBING pipeline (consolidated, current state)
+
+The climb sequence is a per-leg state machine (`Climbing_Dynamics`) wrapped by
+a chassis-level stage machine (`Chassis::handleClimbingMode`). Front legs
+(FL=0, FR=1) climb first; back legs (BL=2, BR=3) follow. Each leg's
+`LegClimbPhase`: IDLE→PREP→DETECT→CLIMBING→COMPLETE.
+
+### Step 1 — enter at theta=0 (transition pose) [HOMING_IN / WAIT_START]
+- On `Set_Mode(CLIMBING)`, `climb_stage_ = HOMING_IN`. All legs smoothstep to
+  motor-frame 0° (ES-style: matched omega_ff + gravity FFW + Kp/Kd ramp +
+  FF wheel comp, A4dd/A4ee). Wheels follow joystick.
+- At 0° → `WAIT_START`: hold at 0°, wait for BTN_X. Approaching the PREP
+  angle from 0° guarantees a single-direction sweep that never crosses the
+  ±180° seam.
+- BTN_X → `startClimbAll()` → all 4 legs enter PREP, `climb_stage_=ACTIVE`.
+
+### Step 2 — PREP (synchronized lift + nose-up lean) [phase PREP]
+- All 4 legs smoothstep `target_theta` 0 → (180-prep_theta_deg)=165° over
+  `prep_ramp_s`=3 s, IN LOCKSTEP (shared ramp clock → no chassis wobble).
+  Driven by flat PD (Set_Leg_PD_Torque, Kp=40/Kd=2, A4kk) + gravity FFW
+  (adaptive mass, A4oo) + matched omega_ff.
+- **Pitch lean-back +10° (nose UP):** `climb_pitch_front_deg=10` shifts CoM
+  backward to unload the front wheels for easier step pivot. Applied via
+  body PID → per-leg dtheta, LPF-smoothed (A4tt). **GEOMETRIC CAVEAT:**
+  at 165° the leg has almost no pitch authority (dH/dθ = r·sin(165°) =
+  0.32 mm/°); with the ±5° dtheta clamp the achievable chassis tilt is only
+  ~0.3-0.6°, NOT 10°. The setpoint is +10° but the realized tilt is small.
+  To get real lean, lower prep angle or raise the dtheta clamp (TODO/open).
+- **PREP mass measurement (A4qq):** while sweeping through sin(θ)>0.7,
+  sample tau_fb/(g·r·sinθ) per leg → measure on-board load (empty vs rider)
+  → seed impedance, so FFW is accurate for the rest of the climb.
+- PREP→DETECT when smoothstep done (alpha≥1) AND leg within prep_tolerance.
+
+### Step 3 — front DETECT (FL/FR step-contact detection) [phase DETECT]
+- FL/FR hold at prep angle (Kp=200 RIGID, A4ss) so step-contact force shows
+  up as a clean torque spike instead of letting the leg yield.
+- Residual = tau_fb − adaptive_gravity (A4oo). In steady state ≈ 0
+  regardless of rider weight; spikes on real contact. Detection: deviation
+  from LPF baseline > torque_res_threshold for detect_confirm_s, while leg
+  velocity < detect_settle_omega.
+- **ISSUE — turning false-trigger:** a yaw maneuver differentially loads the
+  eccentric legs → torque residual mimics step contact. **Fix (A4ad):**
+  `setDetectInhibit(true)` whenever the right-stick (rotation) is deflected
+  past deadzone → all detection suppressed while turning. Detect only when
+  driving (nearly) straight.
+- Contact confirmed → FL/FR enter CLIMBING.
+
+### Step 4a — front CLIMBING (kinematic step pivot) [phase CLIMBING]
+- β integrates at `climb_omega`=0.8 rad/s (A4yy), ramped in via a 0.5 s
+  smoothstep at entry (A4ww, kills the omega step-on jerk). θ from the
+  constraint `cos(θ)=(R+L−h−R·sinβ)/L`; motor target = 180−θ. Flat PD
+  Kp=80/Kd=4 follows.
+- Wheel speed capped to chassis-matching rate × `climb_wheel_speed_ratio`
+  (default 2.0, for joystick assist), hard-ceilinged at 25 RPM (A4xx/A4zz)
+  → wheel never outruns the chassis kinematic forward velocity (no slip
+  runaway) and never exceeds ~1/4 walking pace (passenger safety).
+- Pitch held at +10° nose-up throughout front climb.
+
+### Step 4b — front COMPLETE → nose-down lean → back DETECT
+- FL/FR reach β=90° (or θ_end) → COMPLETE, hold at end-climb pose (front
+  wheels now on top of step).
+- **Re-tilt nose-DOWN −3° (lean forward, A4tt `climb_pitch_back_deg=-3`):**
+  shifts CoM forward, reducing back-wheel pressure for easier back pivot.
+  Optionally `climb_back_lift_offset_deg` (A4ab) directly biases the BL/BR
+  hold angle. (Same geometric caveat applies near 165°.)
+- **ISSUE — back legs near-stall during front trigger:** when the robot
+  hits the step, it decelerates; that impulse plus the whole FL/FR CLIMBING
+  trajectory motion loads the (essentially stalled) back legs, faking a
+  step-contact residual on BL/BR. **Fix (A4ac + A4yy):**
+    - BL/BR DETECT→CLIMBING gated until BOTH FL+FR are COMPLETE (not just
+      climbing) — removes the entire FL/FR-climbing window of vulnerability.
+    - Plus a `back_settle_s`=1 s delay after that, during which BL/BR
+      baselines are snap-reset and re-converged via fast LPF.
+    - Plus the A4ad turning inhibit.
+- After settle, BL/BR detect their own step contact (user drives forward) →
+  BL/BR CLIMBING → COMPLETE. All four COMPLETE → pitch returns to 0
+  (level), climb done.
+
+### Exit — HOMING_OUT
+- Switching out of CLIMBING is intercepted: legs smoothstep back to 0°
+  (ES-style, A4ee) before the actual mode change, so no leg is left near
+  the seam.
+
+### Open items / tuning knobs (Ozone `dbg_ctrl` unless noted)
+- `climb_pitch_front_deg`=10, `climb_pitch_back_deg`=-3, `climb_pitch_lpf_alpha`
+- `climb_omega`=0.8, `climb_ramp_s`=0.5 (config), `climb_wheel_speed_ratio`=2.0
+- `torque_res_threshold`, `detect_confirm_s`(cfg), `detect_settle_omega`(cfg)
+- `back_settle_s`(cfg)=1.0, `climb_back_lift_offset_deg`=0
+- **Geometric pitch authority** at extended leg angles is the main
+  limitation on Steps 2 & 4b: meaningful CoM shift needs either a lower
+  prep angle (less reach) or a larger dtheta clamp (closer to seam). Decide
+  on HW whether the small achievable tilt is sufficient.
+
+---
+
 ## 1. Problem background
 
 - Leg pose: `H = R - r·cos(θ)`. "Highest / climbing-prep" pose ≈ motor **±170°**,
@@ -680,6 +775,498 @@ and no accumulated turns, so **`HOMING_OUT`/return-to-0 band-aid can be removed*
     the indirect path through leg dynamics.
   The system was overdamped on the LEG side but UNDER-damped at the
   body-PID layer -- moving damping from the wrong place to the right place.
+
+- **A4ax — Per-leg smoothstep authorities for COMPLETE-gate AND offsets.**
+  User feedback after A4aw: "FL FR complete 之后还是会出现这个突然类似调整
+  pitch 一样的瞬间响应 很僵硬的位置控制 没有一点平滑，FL FR 突然变矮
+  再突然变高". A4aw only smoothed the BL/BR-CLIMBING dynamics dampening,
+  but TWO step changes at the per-leg CLIMBING->COMPLETE transition were
+  still un-smoothed:
+    1. **`phase_gate` 0->1 step (A4uu)**: the body-PID dtheta was binary
+       gated -- the instant the leg entered COMPLETE, full PID dtheta hit
+       the leg as an impulse. With Kp=200, even 5 deg of dtheta error =
+       17 Nm motor pulse -> "类似调整pitch一样的瞬间响应".
+    2. **`climb_front_drop_deg` 0->15 deg step (A4af)**: the front leg's
+       direct angle offset was applied as a binary on/off. At
+       CLIMBING->COMPLETE entry, target leg angle dropped 15 deg in one
+       tick = "突然变矮". At back-all-COMPLETE release, it snapped back =
+       "再突然变高". Same for back_extend (A4av) on BL/BR.
+  Fix: TWO per-leg smoothstep authorities, ramped over `climb_dtheta_ramp_s`
+  (same tunable as A4aw, default 0.5 s).
+    * `phase_complete_authority_[4]`: target = 1 if leg in COMPLETE else
+      0. Smoothstep 0->1 on COMPLETE entry. Stays 1 (legs don't leave
+      COMPLETE during a climb). Multiplies `phase_gate` -> PID dtheta
+      eases in over 0.5 s after CLIMBING ends.
+    * `leg_offset_authority_[4]`: target = 1 when the leg's direct angle
+      offset (front_drop / back_extend) should apply, else 0. Smoothstep
+      handles BOTH entry (offset eases in over 0.5 s as the leg becomes
+      eligible) AND exit (offset eases out over 0.5 s when the climb
+      finishes / conditions cease).
+  Application sites changed: `phase_gate` now reads from
+  phase_complete_authority instead of the binary check; front_drop and
+  back_extend are now multiplied by leg_offset_authority instead of
+  gated by a binary if. The previous condition logic is now redundant
+  (encoded into the authority's target computation) and removed.
+  Edge cases handled via the start-from-current-value reset pattern
+  (same as A4aw): mid-ramp interrupts (rare, e.g. quick mode-switch)
+  restart the ramp from the current value, not from 0/1, so the leg
+  never visibly snaps.
+  Tunable: increase `climb_dtheta_ramp_s` (Ozone) for even gentler
+  transitions; decrease for snappier engagement. 0 disables smoothing
+  (brings back the snap -- not recommended).
+  Net effect: every climb-phase boundary that previously caused FL/FR
+  to "突然变矮 再突然变高" now ramps smoothly. The leg feels deliberate
+  and continuous, matching the PREP lift profile the user is comfortable
+  with ("就和我进prep一样").
+
+- **A4aw — Smoothstep-ramped FL/FR dtheta authority during BL/BR CLIMBING.**
+  User feedback after A4av: "为什么在 FL FR complete 之后还会有明显的位置环
+  介入，一下上 一下下 非常僵硬". Root cause: FL/FR is in COMPLETE, so A4uu's
+  phase-gate ALLOWS body-PID dtheta. Meanwhile BL/BR's CLIMBING phase
+  rotates beta 0->pi/2 over 2.5 s, which dynamically changes chassis
+  pitch. Body PID sees pitch deviating from its setpoint and pumps
+  correction dtheta into FL/FR's target. With Kp=200 (A4aq), each 1 deg
+  of dtheta = ~3.5 Nm motor impulse -> visible position jerk + "rigid"
+  feel. The PID is reacting to dynamics it shouldn't try to fight (the
+  chassis pose during back-climb is determined by geometry, not by
+  controller authority).
+  Fix: gate FL/FR's dtheta by a smoothstep-ramped authority `[0..1]`.
+    * Target = 0 when BL/BR is in CLIMBING phase
+    * Target = 1 otherwise (full PID leveling restored once back-climb
+      done, for static-pose body leveling)
+    * Smoothstep ramp `climb_dtheta_ramp_s` (default 0.5 s) -- linear
+      ramp would jerk the leg at edge transition; smoothstep matches the
+      PREP lift profile user is comfortable with ("就和我进prep一样")
+    * Per-tick state: authority value + transition start value + target +
+      timer. Edge detection via target-changed -> reset timer & start.
+      Mid-transition interrupts are handled cleanly (start from current
+      value, ramp to new target over ramp_s).
+    * Applied ONLY to FL/FR (i<2). BL/BR's dtheta already zeroed via
+      A4uu's COMPLETE-only phase gate while they're in CLIMBING.
+    * Authority multiplies `phase_gate` -> the dh -> dtheta_deg chain.
+      Inherits the existing +/-15 deg clamp downstream.
+  Effect: when BL/BR enters CLIMBING, FL/FR's PID-driven angle perturbations
+  ramp out over 0.5 s -> leg sits still on its static target (theta_complete
+  + climb_front_drop + A4av back_extend if applicable). When BL/BR all
+  COMPLETE, PID ramps back in for normal body leveling.
+  Open TODO: if even the static-target hold feels jerky from wheel-leg
+  coupling, may need to also lower FL/FR Kp temporarily.
+
+- **A4av — BL/BR direct angle extend mechanism (mirror of front drop).**
+  User HW: detection now works (A4at+A4au) and BL/BR triggers cleanly,
+  but the climb itself struggles -- "后轮会有打滑，前leg可能又会被往前憋" =
+  back wheels slip during their CLIMBING phase, and FL/FR's rigid
+  COMPLETE hold gets strained forward by the back-climb dynamics. User
+  proposal: shift CoM by "back leg up + front leg down". The existing
+  `climb_front_drop_deg = 15` covers half (front legs shorten -> chassis
+  front drops). The other half is added as `climb_back_extend_deg`:
+    * Direct angle offset on BL/BR motor (mirror of front drop, but
+      ADDED instead of subtracted).
+    * Applied throughout BL/BR's DETECT + CLIMBING + COMPLETE while
+      FL/FR are both COMPLETE and BL/BR aren't yet both COMPLETE.
+      Released once climb is fully done.
+    * Default 0 (no behavior change); tune from Ozone.
+    * Signed:
+        - `> 0`: back motor angle larger -> back leg extends -> back
+          rises -> nose-down -> CoM forward -> back UNLOADED (less
+          weight, easier pivot, LESS grip). The "extending" interpretation.
+        - `< 0`: back motor angle smaller -> back leg shortens -> back
+          drops -> nose-up -> CoM backward -> back LOADED (more weight,
+          harder pivot, MORE grip). The "loading-for-grip" interpretation.
+  Trade-off depends on whether the slip is grip-limited (try negative)
+  or load-limited (try positive). Geometric authority is weak at the
+  starting 165 deg (sin(15deg)=0.26, 0.32 mm/deg) but grows through the
+  CLIMBING sweep as the leg approaches 90 deg (sin -> 1.0). For CLIMBING
+  phase the offset rides on top of the kinematic trajectory -- a small
+  deviation from the pure beta-pivot path traded for chassis pose
+  control. Clamps preserved: re-bounded to `[prep_margin, upper_clamp]`
+  (= [15, 175] for back during this window) so the seam stays safe.
+  Open question / TODO: if FL/FR strain persists after CoM tuning, may
+  need to reduce FL/FR Kp during BL/BR CLIMBING to allow chassis
+  rotation freely.
+
+- **A4au — back_settle now triggers on FL/FR CLIMBING entry (not COMPLETE).**
+  After A4at, the gate opened the instant FL/FR entered CLIMBING -- but
+  the user's plot showed TWO peaks in BL/BR `wheel_drop` during a front
+  climb:
+    * **Peak 1 (FALSE, 0-500 ms post-FL-trigger):** the FL/FR climb-entry
+      smoothstep (climb_ramp_s=0.5 s) ramps phi_w 0 -> 0.8 rad/s. The
+      sudden phi_w change couples through the wheel-leg dynamics into a
+      torque/RPM transient on BL/BR that looks identical to step contact.
+    * **Peak 2 (REAL, ~1.5-2.5 s post-FL-trigger):** chassis has advanced
+      ~3-4 cm forward via the climb trajectory; BL/BR wheels reach the
+      step face and decelerate against it -- true step contact.
+  A4at alone would false-trigger on Peak 1. A4ac's BOTH-COMPLETE trigger
+  missed Peak 2 (gate opened ~3.5 s post-FL-trigger, after the LPF
+  baseline had caught up and the signal was gone). Solution: keep A4at's
+  CLIMBING-OR-COMPLETE gate, but trigger `back_settle` (1 s) on the
+  CLIMBING-entry RISING EDGE instead of the COMPLETE edge. Settle blocks
+  the 0-1 s window (skips Peak 1); BL/BR DETECT is then enabled for the
+  rest of FL/FR's CLIMBING and catches Peak 2 cleanly. The CLIMBING-entry
+  edge also serves as a logical baseline-reset point (the LPF now starts
+  tracking the steady-state operating point of "FL/FR mid-climb,
+  BL/BR holding at prep") rather than the pre-climb state. Variable
+  `front_was_complete_` kept as-is for ABI/diff stability; comment notes
+  its new semantics ("both front in CLIMBING-or-COMPLETE").
+
+- **A4at — Relax front_gate from BOTH-COMPLETE to BOTH-CLIMBING-OR-COMPLETE.**
+  User HW data with A4as diagnostics: strong BL/BR `wheel_drop` signals
+  appear ~1.8 s after FL/FR transitions DETECT->CLIMBING, BUT `detect_allowed`
+  for BL/BR doesn't open until ~3.5 s after FL/FR trigger (= 2.5 s FL/FR
+  CLIMBING duration + 1 s `back_settle`). By the time the gate opens, the
+  LPF baseline has caught up and the signal is gone -- auto-detect can't
+  fire on real step contact. Physics: during FL/FR's CLIMBING, the chassis
+  advances ~3-4 cm forward (kinematic forward velocity = R*cos(beta)*phi_w
+  integrated over the climb); after ~1.8 s, the back wheels roll into the
+  step face -> real BL/BR step contact. Fix: front_gate now passes when
+  BOTH front legs are in CLIMBING OR COMPLETE (was: BOTH COMPLETE).
+  `back_settle` still applies on COMPLETE transition (no-op if BL/BR
+  already triggered during CLIMBING; otherwise existing 1 s deceleration-
+  impulse delay). Trade-off: during the first ~0.5 s of FL/FR CLIMBING
+  (the smoothstep ramp-up), wheel-leg coupling transients could mimic
+  step contact -- mitigated by the combined-score threshold (wheel_drop
+  needs >= 12 RPM, well above coupling noise; t_score = 0 because the
+  back legs are at rest with leg PD holding hold_angle). Effectively, the
+  gate now matches the user's mental model: "front pair is climbing -> back
+  pair is fair game once IT also engages the step."
+
+- **A4as — Detection diagnostic plot fields (debug A4ar's mystery).** A4ar
+  added a manual fallback but the *real* question is "why does auto-detect
+  fail when the wheel-velocity drop is obviously visible (28 -> 6 RPM)?".
+  Either combined_score isn't crossing 1.0 (signal too weak after the LPF
+  normalization), or it IS crossing but `detect_allowed` is false (a gate
+  is blocking). Without per-leg visibility there's no way to tell remotely.
+  Added five new Ozone-watchable fields in `DbgClimbPlot`:
+    * `t_score[4]`        -- |residual-baseline|/t_thresh (settled-gated)
+    * `w_score[4]`        -- wheel_drop/w_thresh
+    * `combined_score[4]` -- t+w (>=1.0 = combined_hit fires)
+    * `detect_allowed[4]` -- 1 if gate open (warmed + front_gate + !turning)
+    * `detect_timer_s[4]` -- confirm-timer accumulation, peaks at detect_confirm_s
+  Populated by `Climbing_Dynamics` DETECT case (zero outside DETECT --
+  non-zero on an IDLE/PREP/CLIMBING/COMPLETE leg would indicate a logic
+  bug). User insight that drove this: "感觉力矩残差不明显 速度残差更明显"
+  -- the per-component scores let the user see WHICH residual is doing the
+  work and whether the LPF normalization is the right ratio. If `w_score`
+  alone routinely tops 1.5 while `t_score` stays at 0.2, we can drop the
+  torque path for back legs entirely. Public getters added on
+  `Climbing_Dynamics`: `getTorqueScore`, `getWheelScore`, `getDetectAllowed`,
+  `getDetectTimer`. Chassis polls them every tick and stores into
+  `dbg_climb_plot`. No behavior change -- diagnostics only.
+
+- **A4ar — Manual BTN_X back-pair trigger (reliable fallback).** User HW
+  showed clear wheel-velocity drops on BL (peaks 30 RPM, drops to 0/-10 of
+  25-40 RPM magnitude) but auto-detect still didn't fire -- meaning one of
+  the gates (front-COMPLETE, back_settle, detect_inhibit_) was blocking.
+  Rather than keep debugging the auto path remotely, added a manual
+  override: pressing BTN_X a SECOND time during ACTIVE (after the first
+  press started PREP) force-triggers the BL/BR pair into CLIMBING,
+  bypassing all DETECT gates. Only allowed when FL/FR are both COMPLETE
+  (back can't climb before front geometrically). The user positions back
+  wheels at the step, presses BTN_X, climb starts. New public method
+  `Climbing_Dynamics::manualTriggerBackPair(bl_deg, br_deg)` that calls
+  `beginClimbing` for legs 2 and 3 (no-op if not in DETECT). Diagnostic
+  for auto-detect failure deferred: user to report phase[0/1],
+  back_settle_remaining_s, detect_inhibited, wheel_rpm_drop[2/3] from
+  Ozone when auto-trigger fails.
+
+- **A4aq — User-directed: keep generous cap + harder CLIMBING Kp + COMBINED
+  residual detection.** User feedback on A4ap: "climb_wheel_speed_ratio 5.0
+  没问题，只要把 climbing kp 调硬就好了，BL BR 触发可以综合 leg 的扭矩
+  wheel 的速度 两个残差 因为速度骤降很明显". Three changes:
+  **(1) Revert A4ap cap rollback.** `climb_wheel_speed_ratio` 2->5,
+  `CLIMB_ABSOLUTE_MAX_WHEEL_RPM` 25->40. The wheel-coupling safety issue
+  is addressed by hardening the leg side, NOT by throttling the wheels --
+  which the user needs generous to push the chassis through back climb.
+  **(2) CLIMBING Kp 120 -> 200.** Matches DETECT stiffness. The leg now
+  rigidly holds its trajectory regardless of wheel-coupling reaction
+  torque. omega_ff (matched smoothstep derivative) keeps Kd from
+  fighting commanded motion, so the high Kp doesn't make tracking stiff.
+  This is the actual fix for the "leg gets bent forward, snaps back"
+  safety bug.
+  **(3) Combined sum-of-scores detection.** Replaces OR with weighted sum:
+    - `t_score = torque_deviation / torque_threshold` (0..N)
+    - `w_score = wheel_drop      / wheel_drop_threshold` (0..N)
+    - Trigger when `t_score + w_score >= 1.0`
+  Either signal alone at threshold fires (sum >= 1.0). Both at 0.6 fires
+  (sum=1.2). Per-leg thresholds: front (t=4 Nm, w=25 RPM strict),
+  back (t=2.5 Nm, w=12 RPM sensitive). The combined approach captures
+  the user's HW observation: back contact has clear wheel decel (w
+  contributes large) AND modest torque residual (t contributes some) ->
+  reliable trigger via sum, even when neither alone clearly crosses.
+  Also: Chassis wheel_blocked now = abs_stall ONLY (A4ao velocity drop
+  removed from Chassis OR to avoid double-counting with the combined
+  score in Climbing_Dynamics). `fb.wheel_drop` is now passed in the
+  feedback for the combined score. wheel_blocked stays as a separate
+  OR fallback for clean full-stall cases (front face-jam).
+
+- **A4ap — EMERGENCY safety rollback (wheel coupling overwhelmed leg PD).**
+  User HW: after A4aj raised the wheel cap (5x ratio + 40 RPM absolute),
+  CLIMBING behavior changed dangerously -- "FL FR 触发后...变成瞬间到位，
+  继续往前因为 wheel 的扭矩将 leg 往前掰，导致 leg 会去到前面 然后瞬间归位".
+  Root cause: 40 RPM wheel cap gave the wheel motor enough authority that
+  its reaction torque through the wheel-leg eccentric coupling overwhelmed
+  the leg PD (Kp=80) during CLIMBING. The leg got deflected forward by
+  wheel push past its trajectory target; when the push released or the
+  wheel rolled out, the leg snapped back to target via Kp·err -- a violent
+  "瞬间归位" that's a passenger-safety hazard.
+  **Four rollbacks/hardenings:**
+    1. `climb_wheel_speed_ratio` 5.0 -> 2.0 (A4aj revert).
+    2. `CLIMB_ABSOLUTE_MAX_WHEEL_RPM` 40 -> 25 (A4aj revert, ~1/4 walking
+       pace, no chassis surge feel).
+    3. `WHEEL_DECEL_THRESHOLD` 10 -> 25 RPM (A4ao threshold raised; user
+       push variation gives drops of 10-15 RPM which were false-triggering
+       climb -- 25 RPM drop requires a genuinely big deceleration event).
+    4. **CLIMBING Kp 80 -> 120**: leg PD stiffer so it resists the wheel
+       coupling deflection in the first place. Smaller position error ->
+       smaller (less violent) snap-back if wheel torque does briefly
+       deflect the leg.
+  Net: wheel motor authority limited (1+2), velocity-residual no longer
+  spurious (3), leg holds trajectory firmer (4). Climbing might be slower
+  (less wheel push) -- back-climb robustness may now need a manual BTN_X
+  trigger backup (queued).
+
+- **A4ao — Wheel-velocity RESIDUAL detection (mirror of torque residual).**
+  User HW from BL wheel-RPM plot: wheel clearly decelerates at step
+  contact but doesn't reach absolute-zero RPM -- the absolute stall check
+  even at 15 RPM may not catch a wheel that drops from 30 -> 12 only
+  briefly. User suggested "引入速度残差". **Implementation:** symmetric
+  to leg torque residual:
+    - Per-leg `wheel_rpm_baseline_[i]` updated with slow LPF (alpha=0.02,
+      ~1.6 Hz tau ~100 ms).
+    - `drop = wheel_rpm_baseline - |rpm|`. Positive when wheel slowed
+      below its recent baseline.
+    - `decel_spike = (drop > WHEEL_DECEL_THRESHOLD=10)` -> wheel decelerated
+      >= 10 RPM from its smoothed baseline.
+    - ORed with absolute stall in `raw_stall`. Either path triggers the
+      stall timer / wheel_blocked output.
+    - Reset baseline to current rpm on joystick release.
+  Combined detection:
+    - Front wheel hits face -> stalls to 0 -> absolute path triggers (5 RPM).
+    - Back wheel scrapes edge -> decelerates 30 -> 12 -> velocity-residual
+      path triggers (drop = 18 > 10).
+    - Either way -> wheel_blocked -> Climbing_Dynamics DETECT fires.
+  Plot: `dbg_climb_plot.wheel_rpm_baseline[4]`, `wheel_rpm_drop[4]` --
+  watch alongside wheel RPM to see the residual catching events.
+
+- **A4an — Split wheel-stall RPM threshold front/back.** User HW
+  observation: "BL BR climb 的时候是会有减速现象，但不会堵转为 0，但是
+  前轮 FL FR 是会堵住的". Different physics:
+    - Front wheel hits step FACE directly -> HT motor brakes hard against
+      the step -> wheel reaches near-zero RPM (true full stall).
+    - Back wheel skim/scrapes the step EDGE during chassis-tilted
+      approach -> decelerates from rolling (e.g. 30 RPM) down to 5-12 RPM
+      but keeps slow-slipping (not fully stopped).
+  Single stall threshold can't catch both. **Fix:** split to per-leg.
+    - `WHEEL_STALL_RPM_FRONT = 5` RPM (strict, for the clean front stall)
+    - `WHEEL_STALL_RPM_BACK = 15` RPM (relaxed, catches "decelerated past
+      this point" even if still slow-slipping)
+    - `WHEEL_ROLLING_RPM = 25` RPM (common, was_rolling latch threshold --
+      higher than back stall threshold so there's no overlap)
+  Both the front/back distinction AND the was_rolling latch (A4am) are
+  needed: the latch handles startup false-trigger (spin-up never reaches
+  ROLLING -> stall judgment OFF); the split threshold handles the
+  rolling-vs-stall physics difference between front/back contact.
+
+- **A4am — Wheel-stall STATE MACHINE (fix startup false-trigger).** User HW:
+  "起步很慢并且有大扭矩 直接判断堵转 一动就直接 climb 了". Root cause:
+  the simple "user pushing + low RPM + debounce" was fooled by heavy-load
+  spin-up. From rest the wheel motor pulls high current to accelerate but
+  takes 0.3-0.8 s to cross the 15 RPM threshold -- the raw stall is
+  CONTINUOUSLY true through that window, so even the 0.2 s confirm fired
+  falsely. **Fix:** per-leg "was_rolling" latch. The wheel must FIRST
+  exceed `WHEEL_ROLLING_RPM` = 20 RPM (= genuinely spinning) before stall
+  judgment is enabled. Then if the wheel drops back below
+  `WHEEL_STALL_RPM` = 15 sustained 0.2 s -> stall. Reset on joystick
+  release so each forward push attempt starts fresh.
+    - Spin-up from rest: RPM rises 0->target, doesn't cross 20 yet ->
+      was_rolling = false -> stall judgment OFF -> no false trigger.
+    - Wheel rolled then hit step: RPM crossed 20 -> was_rolling = true,
+      then dropped <15 (jam) -> timer accumulates -> trigger.
+
+- **A4al — Split torque_res_threshold front/back.** User: "前后轮的触发
+  阈值得单独调". Physical reason: front wheel hits the step face directly
+  -> sharp clean torque spike, threshold can be higher. Back wheel often
+  skim/scrapes the edge during approach (chassis tilted from A4af, weight
+  in transition) -> weaker, noisier residual, needs lower threshold.
+  **Implementation:**
+    - `Climbing_Dynamics::Config::torque_res_threshold` (unchanged name,
+      = FRONT, legacy Ozone watch still works). Default 4 Nm.
+    - `Climbing_Dynamics::Config::torque_res_threshold_back` (new). Default
+      2.5 Nm (lower).
+    - DETECT picks `(i < 2) ? front : back` per leg.
+    - `dbg_ctrl.torque_res_threshold` (front) + new
+      `dbg_ctrl.torque_res_threshold_back` -- both Ozone-tunable live.
+    - Plot: `dbg_climb_plot.torque_res_threshold_nm` (front) +
+      `torque_res_threshold_back_nm` (back) for overlay.
+  Tuning: use `dbg_climb_plot.residual_peak_nm[2],[3]` during back
+  contact attempt -> set back threshold ~ 0.5*(peak - noise) + noise.
+
+- **A4ak — Relax wheel-stall threshold (back detect didn't fire).** After
+  A4aj fixed the wheel push (climb now possible), user reported back DETECT
+  "根本没触发" -- never fires. The wheel_blocked condition was too strict:
+  `user_pushing && |rpm| < 5 RPM` sustained 0.3 s. A wheel jammed against
+  the step face often slips slowly at 5-12 RPM (friction creep), not full
+  zero, so it never qualified. **Fix:**
+    - RPM threshold 5 -> 15 (still well below normal driving, ~0.16 m/s)
+    - Confirm time 0.30 -> 0.20 s (faster trigger, spin-up still ~0.1 s)
+
+- **A4aj — Relaxed the wheel cap that was throttling back-climb push.**
+  User HW (wheel current plot, dbg_wheel.cur_*): current was ~1-2 A elevated
+  BEFORE BL/BR entered CLIMBING (user pushing fwd through DETECT), then
+  DROPPED to near 0 the moment CLIMBING started. Diagnosis: A4xx's cap
+  `phi_w * climb_wheel_speed_ratio(2) * 60/2pi` was ~15 RPM with phi_w=0.8,
+  well below the user's push and well below what's needed to overcome the
+  front-wheel brake-lock during back climb. The cap was DESIGNED to
+  prevent wheel slip during front climb (where it worked fine), but for
+  back climb the same cap suppresses the chassis-advance push that back
+  actually requires.
+  **Fix:**
+    - `climb_wheel_speed_ratio` default 2.0 -> 5.0. With phi_w=0.8 this
+      gives a phi_w-cap of ~38 RPM, comfortably above what the user push +
+      A4ai auto-advance produces. Effectively the A4zz absolute ceiling
+      becomes the operative limit.
+    - `CLIMB_ABSOLUTE_MAX_WHEEL_RPM` 25 -> 40 RPM (=0.42 m/s wheel surface
+      = ~1/3 walking pace). Still safe (no surge feel for the passenger),
+      but enough to drive the back wheel through the step engagement.
+  Together: during CLIMBING the user's joystick push + A4ai's auto-advance
+  can deliver up to 40 RPM of forward wheel speed, with NO artificial
+  throttling. Watch `dbg_climb_plot.climb_max_wheel_rpm` -- should now sit
+  at 40, and `dbg_wheel.cur_*` should NOT crash to 0 when CLIMBING starts.
+
+- **A4ai — Auto chassis-advance during CLIMBING (fix back can't climb).**
+  User HW diagnosis: "目前触发是触发了 但是爬不动" -- BL/BR enter CLIMBING
+  (phase=3), the trajectory runs, but the back wheels don't physically lift
+  up the step. **Root cause:** the BACK climb requires the chassis to move
+  FORWARD (geometric requirement of the wheel-pivot-around-step-edge model).
+  The chassis advance requires the FRONT wheels (on the step surface) to
+  roll forward. But HT wheel motors BRAKE when commanded 0 RPM -- if the
+  user isn't pushing the joystick forward hard enough during the back
+  climb, the front wheels stay locked, the chassis can't advance, and the
+  back leg motor stalls (commanded to rotate but the chassis is pinned by
+  the front wheels' brake). The trajectory β keeps integrating but the leg
+  can't follow because the world won't move. Front climb didn't have this
+  because back wheels were on flat ground and could skid; front wheels on
+  the step face brake-lock the chassis.
+  **Fix:** add an automatic forward wheel drive during any CLIMBING phase,
+  at the KINEMATIC chassis-advance rate `cos(beta) * phi_w * scale` (wheel
+  RPM equivalent). phi_w is smoothstep-ramped (A4ww), so the drive ramps
+  in smoothly -- no jerk like the old A4ll-removed `climb_base_rpm` (which
+  was a crude fixed boost). scale (default 1.5) adds grip margin so the
+  climbing wheel is also pushed against the step edge to help it climb up.
+  Added to `vx` before inverseKinematics; the A4xx cap still applies.
+  Now the chassis ADVANCES on its own during climbing -- user push is
+  optional (still works, adds on top). Tunable: `dbg_ctrl.climb_advance_scale`,
+  raise 1.5->2.5 if back climb still sluggish, lower if chassis surges.
+  Plot: `dbg_climb_plot.climb_advance_rpm` shows the active forward drive.
+
+- **A4ah — Debounce wheel-stall (fix spin-up false-trigger).** User caught
+  the bug: at the START of a forward push the wheel motor hasn't spun up
+  yet (RPM still ~0), so the raw `user_pushing && |rpm|<5` condition is TRUE
+  for the first few ticks -> A4ag would false-trigger climb the instant the
+  joystick moves. **Fix:** per-leg `wheel_stall_timer_` in Chassis
+  accumulates while the raw stall holds and resets when the wheel rolls;
+  `wheel_blocked` only fires after the timer exceeds `WHEEL_STALL_CONFIRM_S`
+  = 0.30 s. A genuine step-jam holds the wheel at ~0 indefinitely (timer
+  passes 0.3 s -> blocked); a spin-up transient clears within ~0.1 s as the
+  wheel starts rolling (timer resets -> never blocked). Stall detection is
+  thus ~0.3 s slower but immune to the push-start transient.
+
+- **A4ag — Wheel-stall as a second step-contact detection signal.** User HW:
+  "FL FR 上了，BL BR 卡住蹭台阶边缘 上不去" -- back wheels reach the step
+  but scrape the edge without climbing. The torque-residual path can fail
+  for the back wheel: scraping induces leg vibration that fails the
+  `detect_settle_omega` gate, and/or the residual is too weak. **Fix:** a
+  second, independent contact signal -- `LegClimbFeedback::wheel_blocked`:
+  the user is commanding forward (left-stick past deadzone) but the wheel
+  RPM is ~0 (< 5 RPM) -> the wheel is jammed against the step face. This is
+  an unambiguous "wheel at step" indicator that doesn't depend on leg
+  torque OR the settle gate. DETECT now triggers on
+  `(settled && residual>threshold) || wheel_blocked`, sustained for
+  detect_confirm_s, while detection is allowed (front-gate + not-turning).
+  Computed in Chassis (has both the joystick command and wheel RPM),
+  passed per-leg in the feedback. Plot: `dbg_climb_plot.wheel_blocked[4]`.
+  **DIAGNOSIS STILL NEEDED:** if BL/BR scrape, the user must report whether
+  phase[2],[3] are stuck at 2 (DETECT -- detection not firing, A4ag should
+  now help) or reach 3 (CLIMBING -- triggering but can't physically lift,
+  which would point to load/torque/trajectory, a different fix). Also note:
+  during back CLIMBING the user must KEEP pushing forward so the front
+  wheels roll on the step and the chassis advances -- otherwise the back is
+  geometrically locked and can't pivot up.
+
+- **A4af — Direct front-leg drop for CoM-forward (replaces weak pitch).**
+  User HW report: back wheels can't climb because "重心全压在后轮", and
+  "完全没看到 FL FR complete 之后的 BL BR 伸长，前倾". Diagnosis:
+    - A4ae's pitch tilt used the body-PID dtheta (attenuated by lev_scale
+      0.25 * BODY_PID_SCALE 0.7 = 0.175) and only produced ~1deg -- not
+      visible, not effective.
+    - The user expected BL/BR to EXTEND, but back-leg extension at 165deg
+      has near-zero geometric authority (sin=0.26 -> 0.32 mm/deg) AND
+      approaches the seam. It physically can't produce meaningful tilt.
+  **Effective mechanism = lower the FRONT legs.** At their end-climb angle
+  ~62deg, sin=0.88 -> 1.08 mm/deg, 3x the authority of the back at 165deg.
+  Lowering front legs drops the chassis front -> nose-down -> CoM forward
+  -> back wheels unloaded. **Fix:** new `dbg_ctrl.climb_front_drop_deg`
+  (default 15deg). In the climbing direct branch, when a FRONT leg is in
+  COMPLETE and the back legs haven't both COMPLETE yet, subtract
+  climb_front_drop_deg from its target angle (re-clamped to >= prep_margin).
+  Direct, strong, visible: 15deg front lowering (62->47) gives ~19mm
+  chassis drop -> ~3.6deg nose-down. Released once all four legs COMPLETE.
+  Front wheels stay on the step (they're resting on top); only the chassis
+  attitude changes. Tunable: raise for more CoM shift (watch for tip-
+  forward over the step edge), lower for less.
+  NOTE: the A4ae body-PID pitch dtheta (COMPLETE-only, +-15 clamp) still
+  exists and stacks a small additional tilt, but climb_front_drop_deg is
+  now the primary, deterministic CoM-shift knob.
+
+- **A4ae — Coupled-pair detection trigger + stronger post-front pitch.**
+  User HW report: "实际 fb deg 为 +-1deg 基本没有变化"(pitch tilt too weak)
+  and "FL FR 残差检测...有时一个触发一个不触发，有时都不触发"(detection
+  unreliable). Two fixes:
+  **(1) Coupled-pair trigger (detection robustness).** The two front wheels
+  (or two back wheels) physically contact the same step edge together, but
+  per-leg friction / approach-angle differences make one leg's residual
+  cross threshold well before the other -- and sometimes the laggard never
+  crosses. New `beginClimbing(idx, motor_deg)` helper; when EITHER leg of a
+  pair confirms contact, BOTH legs of that pair (front {0,1} or back {2,3})
+  transition DETECT->CLIMBING, each seeding beta from its own motor angle.
+  Fixes "one triggers, one doesn't"; also helps "neither" since only ONE
+  leg now needs to cross threshold.
+  **(2) Post-front pitch authority.** The +-1deg the user saw was the +-5deg
+  dtheta clamp at extended leg angles. Two changes:
+    - Pitch dtheta now applies ONLY in COMPLETE phase (was CLIMBING+COMPLETE).
+      During CLIMBING the trajectory drives theta 165->62; a +10deg nose-up
+      dtheta FOUGHT that motion. Removing it from CLIMBING = clean pivot.
+    - dtheta clamp +-5 -> +-15 deg. Safe now because it only acts in
+      COMPLETE where front legs are at ~62deg (sin=0.88, good authority,
+      far from seam; new_theta [15,165] clamp still catches it). Post-front
+      nose-down now reaches ~3deg (15mm front-leg lowering) instead of ~1deg.
+  NOTE: the PREP nose-up (+10deg) is now effectively unused (PREP gated, and
+  it fought the climb anyway). The useful pitch is the post-front nose-down
+  in COMPLETE. If stronger CoM shift still needed, raise the clamp further
+  or lower prep/end-climb angles.
+
+- **A4ad — Pipeline consolidation: pitch values + turning detect-inhibit.**
+  User asked to re-organize the climbing pipeline (see Section 0). Two
+  concrete code changes alongside the doc:
+    1. Pitch setpoints retuned to the user's spec: `climb_pitch_front_deg`
+       15 -> 10 (PREP/front nose-up lean-back to unload front wheels);
+       `climb_pitch_back_deg` -5 -> -3 (post-front nose-down lean-forward
+       to shift CoM forward / unload back wheels). NOTE the geometric
+       caveat: at ~165 deg leg extension the pitch authority is tiny
+       (~0.3-0.6 deg realized for a 10 deg setpoint), so these are
+       aspirational setpoints; real tilt is small until prep angle is
+       lowered or dtheta clamp raised.
+    2. Turning detect-inhibit (addresses the user's "step 3" concern that
+       turning torque false-triggers climb): `Climbing_Dynamics::
+       setDetectInhibit(bool)` + `detect_inhibit_` member; when set, ALL
+       DETECT->CLIMBING transitions are suppressed. Chassis sets it from
+       the RAW right-stick (rotation) magnitude (`cmd.right_joystick.
+       r_x1000_msg > 200`) -- read directly, NOT via
+       Map_Joystick_To_Velocity (which has a once-per-tick stateful slew
+       limiter owned by the wheel block). Plot: `dbg_climb_plot.detect_inhibited`.
+  The user's "step 4" concern (back legs near-stall false-trigger when
+  front triggers) is already covered by A4ac (front-BOTH-COMPLETE gate) +
+  A4yy (back_settle + baseline reset) + this A4ad turning inhibit.
 
 - **A4ac — Strict front-COMPLETE gate (replaces A4vv any-front-CLIMBING).**
   User: "目前不明显，还是会有后轮误触发情况". A4vv let BL/BR DETECT after

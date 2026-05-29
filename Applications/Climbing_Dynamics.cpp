@@ -59,6 +59,21 @@ void Climbing_Dynamics::startClimbAll()
     startClimb(3);
 }
 
+void Climbing_Dynamics::beginClimbing(int idx, float current_motor_deg)
+{
+    if (idx < 0 || idx > 3)
+        return;
+    if (legs_[idx].phase != LegClimbPhase::DETECT)
+        return;  // only transition from DETECT (don't disturb already-climbing legs)
+    legs_[idx].phase = LegClimbPhase::CLIMBING;
+    // Seed beta from this leg's CURRENT motor angle (model theta = 180 - |motor|).
+    float theta_model_rad = (180.0f - fabsf(current_motor_deg)) * PI / 180.0f;
+    if (theta_model_rad < cfg_.theta_min_deg * PI / 180.0f)
+        theta_model_rad = cfg_.theta_min_deg * PI / 180.0f;
+    legs_[idx].beta        = computeBetaFromTheta(theta_model_rad);
+    legs_[idx].climb_ramp_t = 0.0f;  // start CLIMBING-entry smoothstep
+}
+
 bool Climbing_Dynamics::isDirectControl(int idx) const
 {
     LegClimbPhase p = legs_[idx].phase;
@@ -156,25 +171,41 @@ void Climbing_Dynamics::update(const LegClimbFeedback feedback[4], float dt)
     float prep_rad  = cfg_.prep_theta_deg * PI / 180.0f;
     float h_prep    = heightFromTheta(prep_rad);
 
-    // A4ac: Detect FL/FR BOTH-COMPLETE transition to start back-leg
-    // settle window. The chassis is in motion throughout the entire
-    // FL/FR CLIMBING phase (beta advancing, chassis moving forward and
-    // up via the trajectory) -- back legs see varying load and dynamic
-    // torque transients during that whole window. So only arm BL/BR
-    // detection after FL/FR are fully at rest in COMPLETE phase.
+    // A4au: trigger back_settle on FL/FR FIRST-ENTER-CLIMBING (replaces
+    // A4ac's BOTH-COMPLETE trigger).
     //
-    // Previously (A4yy): armed on first FL/FR -> CLIMBING. That gave
-    // a 1 s window inside an active ~2.5 s climbing dynamic, which was
-    // insufficient -- false triggers persisted.
-    bool both_front_complete_now = (legs_[0].phase == LegClimbPhase::COMPLETE &&
-                                    legs_[1].phase == LegClimbPhase::COMPLETE);
-    if (!front_was_complete_ && both_front_complete_now)
+    // User HW data revealed TWO BL/BR wheel_drop peaks during a front
+    // climb:
+    //   (1) ~0 to 500 ms after FL/FR DETECT->CLIMBING: FALSE peak --
+    //       the climb-entry smoothstep (climb_ramp_s = 0.5 s) ramps
+    //       phi_w from 0 to 0.8 rad/s, producing a wheel-leg coupling
+    //       transient that decelerates BL/BR wheels (looks like step
+    //       contact but is just dynamics).
+    //   (2) ~1.5 to 2.5 s after FL/FR DETECT->CLIMBING: REAL peak --
+    //       FL/FR climb has advanced the chassis ~3-4 cm forward, BL/BR
+    //       wheels reach the step face, true step contact.
+    //
+    // A4ac's COMPLETE-trigger missed peak (2) entirely (gate opened at
+    // ~3.5 s, by which time the LPF baseline had caught up and the
+    // signal was gone). A4at's CLIMBING-OR-COMPLETE relaxation without
+    // a settle would false-trigger on peak (1).
+    //
+    // The fix: arm back_settle (1 s) on the CLIMBING-entry edge. The
+    // settle blocks peak (1) entirely; once it expires (~1 s into
+    // CLIMBING), BL/BR DETECT is enabled and catches peak (2) at
+    // ~1.5-1.8 s into CLIMBING. Baseline reset accompanies the trigger
+    // so the LPF starts fresh after FL/FR's coupling dynamics settle.
+    bool both_front_climbing_or_complete_now =
+        (legs_[0].phase == LegClimbPhase::CLIMBING || legs_[0].phase == LegClimbPhase::COMPLETE) &&
+        (legs_[1].phase == LegClimbPhase::CLIMBING || legs_[1].phase == LegClimbPhase::COMPLETE);
+    if (!front_was_complete_ && both_front_climbing_or_complete_now)
     {
-        // Just-now both-complete transition: arm the delay window.
+        // Rising edge of "both front legs entered CLIMBING (or COMPLETE)"
+        // -- arm the settle window to mask climb-entry coupling transient.
         back_settle_remaining_s_ = cfg_.back_settle_s;
         // Snap-reset BL/BR baseline so the LPF starts tracking the new
-        // (post-climb-settle) operating point cleanly rather than slowly
-        // catching up to a load-shift that accumulated during FL/FR climb.
+        // (post-climb-entry) operating point cleanly rather than slowly
+        // catching up to dynamics accumulated during FL/FR's ramp-up.
         legs_[2].torque_baseline   = feedback[2].leg_torque_residual;
         legs_[3].torque_baseline   = feedback[3].leg_torque_residual;
         legs_[2].baseline_warmup_s = 0.0f;  // re-arm fast LPF for re-convergence
@@ -182,7 +213,7 @@ void Climbing_Dynamics::update(const LegClimbFeedback feedback[4], float dt)
         legs_[2].detect_timer_s    = 0.0f;  // clear any partial confirm timer
         legs_[3].detect_timer_s    = 0.0f;
     }
-    front_was_complete_ = both_front_complete_now;
+    front_was_complete_ = both_front_climbing_or_complete_now;  // var name kept for ABI stability; semantics: "both front in CLIMBING-or-COMPLETE"
     if (back_settle_remaining_s_ > 0.0f)
     {
         back_settle_remaining_s_ -= dt;
@@ -199,6 +230,14 @@ void Climbing_Dynamics::update(const LegClimbFeedback feedback[4], float dt)
         // overrides this with the current ramped phi_w. Chassis reads this via
         // getEffectivePhiW() to cap wheel-motor speed during active climbing.
         leg.climb_phi_w_current = 0.0f;
+
+        // A4as: clear detection diagnostic outputs by default; DETECT case
+        // overwrites with live values. Outside DETECT they read as zero / false
+        // in Ozone (helpful: a non-zero score on a leg NOT in DETECT would
+        // indicate a logic bug).
+        per_leg_t_score_[i]        = 0.0f;
+        per_leg_w_score_[i]        = 0.0f;
+        per_leg_detect_allowed_[i] = false;
 
         switch (leg.phase)
         {
@@ -298,44 +337,108 @@ void Climbing_Dynamics::update(const LegClimbFeedback feedback[4], float dt)
             leg.torque_baseline             = alpha_use * fb.leg_torque_residual + (1.0f - alpha_use) * leg.torque_baseline;
             leg.baseline_warmup_s += dt;
 
-            // FRONT-BOTH-COMPLETE GATE (A4ac, replaces A4vv's any-front-
-            // climbing gate):
-            // Back legs (BL=2, BR=3) cannot enter CLIMBING until:
-            //   1. BOTH FL and FR are in COMPLETE phase, AND
-            //   2. back_settle_remaining_s_ has counted down to 0
+            // FRONT-GATE for BL/BR (A4at, relaxed from A4ac):
+            // Back legs (BL=2, BR=3) cannot enter CLIMBING until BOTH front
+            // legs are in CLIMBING OR COMPLETE phase. Previously required
+            // BOTH COMPLETE + 1 s back_settle -- but user data showed BL/BR
+            // step contact happens ~1.8 s INTO FL/FR's CLIMBING phase
+            // (chassis advances during front climb -> back wheels roll
+            // forward and hit the step face). The old gate, which only
+            // opened ~3.5 s post-FL-trigger (FL/FR climb time 2.5 s + 1 s
+            // settle), missed this signal entirely (LPF baseline caught up
+            // by then). Now: as soon as FL/FR start climbing the gate opens,
+            // so when BL/BR's real step contact signal arises 1.8 s later
+            // it can fire. back_settle still applies for the COMPLETE
+            // transition (existing behavior, no-op for the common case where
+            // BL/BR triggers during FL/FR CLIMBING and exits DETECT first).
             //
-            // Why stricter than A4vv: during the entire FL/FR CLIMBING phase
-            // (~2.5 s with climb_omega=0.8), the chassis is in motion via the
-            // trajectory -- back legs experience time-varying load and
-            // dynamic torque transients that easily exceed the residual
-            // threshold even with baseline LPF. Earlier "any front climbing"
-            // gate plus 1 s settle window proved insufficient. Requiring
-            // BOTH front legs at rest in COMPLETE removes the window of
-            // vulnerability entirely; back detection only proceeds when the
-            // system is genuinely static after front climb finishes.
+            // Why CLIMBING-OR-COMPLETE (not just CLIMBING): if BL/BR signal
+            // arrives slightly after FL/FR COMPLETE, we still want to trigger.
+            //
+            // False-trigger risk during the initial 0-0.5 s of FL/FR CLIMBING
+            // (smoothstep ramp): coupling transients could mimic step
+            // contact. Mitigated by combined-score threshold (wheel_drop
+            // alone needs >= 12 RPM, which is well above coupling noise).
             bool is_back_leg = (i >= 2);
-            bool both_front_complete = (legs_[0].phase == LegClimbPhase::COMPLETE &&
-                                        legs_[1].phase == LegClimbPhase::COMPLETE);
+            auto front_in_climbing_or_complete = [&](int idx) {
+                LegClimbPhase p = legs_[idx].phase;
+                return p == LegClimbPhase::CLIMBING || p == LegClimbPhase::COMPLETE;
+            };
+            bool both_front_climbing_or_complete =
+                front_in_climbing_or_complete(0) && front_in_climbing_or_complete(1);
             bool back_settle_done    = (back_settle_remaining_s_ <= 0.0f);
-            bool front_gate_pass     = !is_back_leg || (both_front_complete && back_settle_done);
+            bool front_gate_pass     = !is_back_leg || (both_front_climbing_or_complete && back_settle_done);
+            // A4ad: global turning inhibit -- suppress detection while the
+            // robot is yawing (differential wheel load fakes a step-contact
+            // residual). Applies to both front and back legs.
+            bool detect_allowed      = front_gate_pass && !detect_inhibit_;
 
-            // Step detection: only after warmup AND while the leg is settled.
-            // The closed-loop drive torque during motion appears in the residual
-            // and would false-trigger CLIMBING, so require low leg speed.
+            // Step detection: TWO independent contact signals (A4ag).
+            //
+            //  (a) Torque-residual path: leg torque deviates from gravity
+            //      baseline by > threshold, while the leg is settled (low
+            //      vel). Sensitive but confounded by leg motion / scraping.
+            //  (b) Wheel-stall path: the user is commanding the wheel
+            //      forward but the wheel RPM is ~0 -> it's jammed against the
+            //      step face. Unambiguous "wheel at step" signal, independent
+            //      of leg torque AND of the settle gate (a stalled wheel
+            //      doesn't require the leg to be still). This is what catches
+            //      the back wheel "蹭台阶边缘" case where the leg vibrates
+            //      from scraping (failing the settle gate) and/or the
+            //      residual is too weak to cross threshold.
+            //
+            // Either path, sustained for detect_confirm_s while detection is
+            // allowed (front-gate + not-turning), confirms contact.
             float deviation = fabsf(fb.leg_torque_residual - leg.torque_baseline);
             bool settled    = (fabsf(fb.leg_vel_radps) < cfg_.detect_settle_omega);
-            if (warmed_up && settled && deviation > cfg_.torque_res_threshold && front_gate_pass)
+            // A4al + A4aq: per-leg thresholds for torque AND wheel-drop.
+            // Front: stronger contact, higher thresholds. Back: weaker
+            // residuals, lower thresholds.
+            float t_thresh = (i < 2) ? cfg_.torque_res_threshold : cfg_.torque_res_threshold_back;
+            float w_thresh = (i < 2) ? cfg_.wheel_drop_threshold : cfg_.wheel_drop_threshold_back;
+
+            // A4aq: COMBINED sum-of-scores detection. Each residual signal
+            // is normalized to its threshold (1.0 = at threshold). Trigger
+            // when the SUM crosses 1.0. This lets either signal alone fire
+            // (if it crosses its own threshold), OR both moderate signals
+            // fire together (e.g. each at 0.6 of threshold -> sum 1.2 ->
+            // trigger). Per user: "在遇到门槛时候的速度骤降很明显" --
+            // combining the obvious wheel decel with the weaker back-leg
+            // torque residual gives robust back detection.
+            float t_score = settled ? (deviation / t_thresh) : 0.0f;
+            float w_score = (fb.wheel_drop > 0.0f) ? (fb.wheel_drop / w_thresh) : 0.0f;
+            bool combined_hit = (t_score + w_score >= 1.0f);
+            // Plus the wheel-blocked (absolute stall, was_rolling-gated)
+            // path as an additional OR fallback for clean full-stall cases.
+            bool detect_fires = combined_hit || fb.wheel_blocked;
+
+            // A4as: publish per-leg detection diagnostics (Ozone plot).
+            // Reads:
+            //   t_score        -- torque residual normalized to threshold (>=1 alone fires)
+            //   w_score        -- wheel-drop normalized to threshold       (>=1 alone fires)
+            //   combined_score (= t+w) -- crosses 1.0 to trigger (combined_hit)
+            //   detect_allowed -- TRUE iff gate (front_gate + !inhibit) open
+            // If t+w >= 1 but detect_allowed = false, a gate is blocking.
+            per_leg_t_score_[i]        = t_score;
+            per_leg_w_score_[i]        = w_score;
+            per_leg_detect_allowed_[i] = detect_allowed && warmed_up;
+            if (warmed_up && detect_allowed && detect_fires)
             {
                 leg.detect_timer_s += dt;
                 if (leg.detect_timer_s >= cfg_.detect_confirm_s)
                 {
-                    // Step confirmed — begin climbing from hold angle
-                    leg.phase             = LegClimbPhase::CLIMBING;
-                    float theta_model_rad = (180.0f - hold_angle) * PI / 180.0f;
-                    if (theta_model_rad < cfg_.theta_min_deg * PI / 180.0f)
-                        theta_model_rad = cfg_.theta_min_deg * PI / 180.0f;
-                    leg.beta = computeBetaFromTheta(theta_model_rad);
-                    leg.climb_ramp_t = 0.0f;  // start CLIMBING-entry smoothstep
+                    // A4ae: COUPLED-PAIR trigger. The two front wheels (or two
+                    // back wheels) hit the same step edge together physically.
+                    // Per-leg friction / approach-angle differences mean one
+                    // leg's residual often crosses threshold noticeably before
+                    // the other -- and sometimes the laggard never crosses
+                    // ("一个触发一个不触发"). So when EITHER leg of a pair
+                    // confirms contact, start BOTH legs of that pair climbing
+                    // together. Front pair = {0,1}, back pair = {2,3}. Each
+                    // leg's beta is seeded from ITS OWN current motor angle.
+                    int pair0 = (i < 2) ? 0 : 2;
+                    beginClimbing(pair0,     feedback[pair0].leg_pos_deg);
+                    beginClimbing(pair0 + 1, feedback[pair0 + 1].leg_pos_deg);
                 }
             }
             else
