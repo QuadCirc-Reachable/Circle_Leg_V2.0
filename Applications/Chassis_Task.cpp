@@ -1,3 +1,13 @@
+/**
+ * @file    Chassis_Task.cpp
+ * @brief   FreeRTOS chassis task: 500 Hz control loop (PC command in ->
+ *          Chassis::Update -> motor commands -> feedback out).
+ *
+ * Circle_Leg_V2 - REACHABLE (QuadCirc) full-size prototype firmware.
+ *
+ * @author  LIU Hualin
+ */
+
 #include "Chassis_Task.hpp"
 
 #include "Robot_Config.hpp"

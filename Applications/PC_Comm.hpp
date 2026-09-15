@@ -1,3 +1,13 @@
+/**
+ * @file    PC_Comm.hpp
+ * @brief   UART link to the host PC (RosComm framing): command reception, feedback
+ *          transmission and 500 ms link-loss detection.
+ *
+ * Circle_Leg_V2 - REACHABLE (QuadCirc) full-size prototype firmware.
+ *
+ * @author  LIU Hualin
+ */
+
 #pragma once
 #include "AppConfig.h"
 #include "Comm_Msg.hpp"

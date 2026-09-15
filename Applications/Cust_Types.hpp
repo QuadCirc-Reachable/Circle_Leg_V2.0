@@ -1,3 +1,12 @@
+/**
+ * @file    Cust_Types.hpp
+ * @brief   Shared application types: Chassis_State, MIT_Params, Wheel_Leg_Params.
+ *
+ * Circle_Leg_V2 - REACHABLE (QuadCirc) full-size prototype firmware.
+ *
+ * @author  LIU Hualin
+ */
+
 #pragma once
 namespace Applications
 {

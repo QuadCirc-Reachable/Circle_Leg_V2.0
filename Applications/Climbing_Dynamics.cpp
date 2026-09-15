@@ -1,3 +1,13 @@
+/**
+ * @file    Climbing_Dynamics.cpp
+ * @brief   Per-leg step-climbing state machine (IDLE -> PREP -> DETECT -> CLIMBING ->
+ *          COMPLETE): torque-residual step detection and kinematic climbing trajectory.
+ *
+ * Circle_Leg_V2 - REACHABLE (QuadCirc) full-size prototype firmware.
+ *
+ * @author  LIU Hualin
+ */
+
 #include "Climbing_Dynamics.hpp"
 
 namespace Applications

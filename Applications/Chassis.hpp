@@ -1,3 +1,13 @@
+/**
+ * @file    Chassis.hpp
+ * @brief   Chassis orchestrator: mode state machine, IMU attitude, body leveling,
+ *          inverse kinematics and per-leg height distribution.
+ *
+ * Circle_Leg_V2 - REACHABLE (QuadCirc) full-size prototype firmware.
+ *
+ * @author  LIU Hualin
+ */
+
 #pragma once
 #include "Climbing_Dynamics.hpp"
 #include "Comm_Msg.hpp"

@@ -1,3 +1,14 @@
+/**
+ * @file    Wheel_Leg.cpp
+ * @brief   One CircLeg corner (wheel motor + eccentric leg motor): height <-> angle
+ *          conversion, MIT leg command pipeline, wheel velocity loop and wheel-leg
+ *          decoupling compensation.
+ *
+ * Circle_Leg_V2 - REACHABLE (QuadCirc) full-size prototype firmware.
+ *
+ * @author  LIU Hualin
+ */
+
 #include "Wheel_Leg.hpp"
 
 #include <cmath>

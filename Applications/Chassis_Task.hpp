@@ -1,3 +1,13 @@
+/**
+ * @file    Chassis_Task.hpp
+ * @brief   FreeRTOS chassis task: 500 Hz control loop (PC command in ->
+ *          Chassis::Update -> motor commands -> feedback out).
+ *
+ * Circle_Leg_V2 - REACHABLE (QuadCirc) full-size prototype firmware.
+ *
+ * @author  LIU Hualin
+ */
+
 #pragma once
 #include "Comm_Msg.hpp"
 #include "DJIMotor.hpp"

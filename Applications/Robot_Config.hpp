@@ -1,3 +1,13 @@
+/**
+ * @file    Robot_Config.hpp
+ * @brief   Hardware instantiation: HT8115 wheel motors, DM J10010L-2EC leg motors,
+ *          CAN bus / ID mapping, per-leg MIT parameters and Wheel_Leg pairing.
+ *
+ * Circle_Leg_V2 - REACHABLE (QuadCirc) full-size prototype firmware.
+ *
+ * @author  LIU Hualin
+ */
+
 #pragma once
 #include "Chassis.hpp"
 #include "HT8115.hpp"
