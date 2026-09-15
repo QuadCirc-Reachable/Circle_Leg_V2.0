@@ -1,5 +1,7 @@
 # Circle Leg V1 — Final Year Project Technical Report
 
+> **Scope note (Circle_Leg_V2):** this report was written for the half-size prototype (Circle_Leg_V1: M3508 wheels, HT8115 legs) and uses V1's angle convention $H(	heta) = R + r\cos	heta$. The control architecture carries over to V2 unchanged; see the [README](../README.md) for the full-size hardware, parameters and V2's convention $H(	heta) = R - r\cos	heta$ (legs zeroed at the lowest pose).
+
 ## Table of Contents
 
 1. [Project Overview](#1-project-overview)
