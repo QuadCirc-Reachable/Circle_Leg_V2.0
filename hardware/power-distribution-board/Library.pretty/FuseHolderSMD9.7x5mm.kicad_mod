@@ -1,0 +1,106 @@
+(footprint "FuseHolderSMD9.7x5mm"
+	(version 20241229)
+	(generator "pcbnew")
+	(generator_version "9.0")
+	(layer "F.Cu")
+	(property "Reference" "REF**"
+		(at 0 5.5 0)
+		(unlocked yes)
+		(layer "F.SilkS")
+		(uuid "1e6b2d3a-afbb-4984-a873-c14abec4cd44")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.1)
+			)
+		)
+	)
+	(property "Value" "FuseHolderSMD9.7x5mm"
+		(at 0 1 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(uuid "f9751abc-3b8f-4771-bc19-7cfb22173961")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Datasheet" ""
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "428c0e86-62af-41c6-b20b-7aaf3777b3b7")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Description" ""
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "b1581cb5-650b-4877-a0a0-26b1972384c0")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(attr smd)
+	(fp_line
+		(start -4.9 -2.5)
+		(end 4.9 -2.5)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "c5429e44-71fa-46fa-a927-c804185c20dc")
+	)
+	(fp_line
+		(start -4.9 2.5)
+		(end 4.9 2.5)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "e594c62d-0fde-44f2-9f13-1a5377118fa5")
+	)
+	(fp_text user "${REFERENCE}"
+		(at 0 2.5 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(uuid "ffd2652f-ec23-41e6-ac79-82a83d997bf3")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(pad "1" smd roundrect
+		(at -3.185 0)
+		(size 4.24 3.81)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(roundrect_rratio 0.15)
+		(thermal_bridge_angle 45)
+		(uuid "81078bd9-3520-41ec-90d3-665308ef5b79")
+	)
+	(pad "2" smd roundrect
+		(at 3.185 0)
+		(size 4.24 3.81)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(roundrect_rratio 0.15)
+		(thermal_bridge_angle 45)
+		(uuid "74fca134-c81f-42b1-bf77-67db395b382b")
+	)
+	(embedded_fonts no)
+)
