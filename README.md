@@ -13,8 +13,9 @@
 </p>
 
 <p align="center">
-  <img src="docs/figures/fullsize_prototype.jpg" width="620" alt="Full-size REACHABLE prototype">
+  <img src="docs/figures/cover.jpg" width="360" alt="Full-size REACHABLE prototype on display at HKUST ISD">
 </p>
+<p align="center"><sub>The full-size prototype on display at HKUST ISD · 全尺寸原型在港科大 ISD 展出</sub></p>
 
 Embedded control firmware for the **full-size REACHABLE (QuadCirc) electric wheelchair**. It has four
 **CircLeg** eccentric wheel-leg modules. Each one rolls as an ordinary wheel on flat ground and turns
@@ -40,13 +41,14 @@ the whole time. With only **two motors per corner** (one wheel motor, one leg mo
 - **Stays safe:** host link-loss detection (500 ms), smooth mode transitions, singularity clamping,
   and live-tunable debug structs for SEGGER Ozone.
 
-This repository is one of three:
+Related repositories:
 
 | Repository | Content |
 |------------|---------|
 | **Circle_Leg_V2** (this repo) | Firmware for the full-size prototype (final deliverable), PCB and CAD |
 | [Circle_Leg_V1.0](https://github.com/QuadCirc-Reachable/Circle_Leg_V1.0) | Firmware for the half-size proof-of-concept prototype |
-| [Circle_Leg_Host_V1.0](https://github.com/QuadCirc-Reachable/Circle_Leg_Host_V1.0) | Host-side gamepad → UART bridge (Python) |
+| [Circle_Leg_Host_V2.0](https://github.com/QuadCirc-Reachable/Circle_Leg_Host_V2.0) | Host software: gamepad link + optional RealSense curb vision (Python package) |
+| [Circle_Leg_Host_V1.0](https://github.com/QuadCirc-Reachable/Circle_Leg_Host_V1.0) | Previous single-script gamepad → UART bridge |
 
 ---
 
@@ -69,9 +71,10 @@ This repository is one of three:
   爬升；前轮对先爬，后轮对随后。
 - **安全**：上位机断连检测（500 ms）、平滑的模式切换、奇异点限幅，以及可在 SEGGER Ozone 中实时调参的调试结构体。
 
-本项目共三个仓库：本仓库（全尺寸固件 + PCB + 结构件）、
+相关仓库：本仓库（全尺寸固件 + PCB + 结构件）、
 [Circle_Leg_V1.0](https://github.com/QuadCirc-Reachable/Circle_Leg_V1.0)（半尺寸原型固件）、
-[Circle_Leg_Host_V1.0](https://github.com/QuadCirc-Reachable/Circle_Leg_Host_V1.0)（上位机手柄 → 串口桥接）。
+[Circle_Leg_Host_V2.0](https://github.com/QuadCirc-Reachable/Circle_Leg_Host_V2.0)（上位机：手柄链路 + 可选 RealSense 台阶视觉）、
+[Circle_Leg_Host_V1.0](https://github.com/QuadCirc-Reachable/Circle_Leg_Host_V1.0)（旧版单文件手柄 → 串口桥接）。
 
 </details>
 
@@ -112,7 +115,7 @@ Full-size prototype, as reported in the team's final project report (June 2026):
 ```
 ┌──────────────────────────┐  UART 2 Mbit/s (CH343)   ┌──────────────────────────────────────────────┐
 │ Host (Jetson Orin Nano)  │ ── PC_Msg @ 30 Hz ─────► │ STM32G473 · FreeRTOS                         │
-│ Circle_Leg_Host          │ ◄── Reachable_Msg ────── │                                              │
+│ Circle_Leg_Host_V2       │ ◄── Reachable_Msg ────── │                                              │
 │ Xbox gamepad → frames    │                          │  PC_Comm (link watchdog 500 ms)              │
 └──────────────────────────┘                          │     │                                        │
                                                       │     ▼                                        │
@@ -319,7 +322,7 @@ STM32CubeProgrammer. For live tuning, open the ELF in SEGGER Ozone and watch or 
 
 ## Operator Controls | 操作说明
 
-Xbox gamepad on the host (see [Circle_Leg_Host_V1.0](https://github.com/QuadCirc-Reachable/Circle_Leg_Host_V1.0)):
+Xbox gamepad on the host (see [Circle_Leg_Host_V2.0](https://github.com/QuadCirc-Reachable/Circle_Leg_Host_V2.0)):
 
 | Input | Function |
 |-------|----------|
@@ -355,9 +358,23 @@ USART2 at **2 Mbit/s**, RosComm framing with CRC16:
 `Reachable_Msg` (MCU → host, 40 bytes) reports each corner's leg position (deg × 10) and wheel RPM.
 The field names still say GM6020 / M3508, left over from the half-size hardware.
 
+Host V2.0 can also send RealSense curb-detection results (`0xFC`) and accept a vision-control
+heartbeat (`0xFD`). This firmware consumes only the `0xFF` gamepad link. The MCU-side changes
+needed to close the vision-in-the-loop climb are in Host V2.0's
+[MCU integration guide](https://github.com/QuadCirc-Reachable/Circle_Leg_Host_V2.0/blob/main/docs/MCU_Integration_Guide.md).
+
 ---
 
 ## Hardware | 硬件
+
+<div align="center">
+<table>
+  <tr>
+    <td align="center"><img src="docs/figures/dev_side_view.jpg" height="340" alt="Side view of the full-size prototype during development"><br><sub>Side view during development · 开发阶段侧视图</sub></td>
+    <td align="center"><img src="docs/figures/fullsize_prototype.jpg" height="340" alt="CircLeg modules, front view"><br><sub>CircLeg modules, front view · 轮腿模块正视图</sub></td>
+  </tr>
+</table>
+</div>
 
 | Item | Specification |
 |------|---------------|
@@ -397,6 +414,10 @@ a fan, using XT30 connectors. Custom footprints are in `Library.pretty/`.
 
 ## Team | 团队
 
+<p align="center">
+  <img src="docs/figures/team.jpg" width="560" alt="The REACHABLE team at the HKUST ISD Class of 2026 event">
+</p>
+
 **REACHABLE (QuadCirc)**, HKUST Final Year Design Project SL05a-25:
 
 - **LIU Hualin** — embedded control lead: motor and MCU selection, dual-CAN hardware, and all of the firmware and control algorithms in this repository
@@ -420,3 +441,9 @@ The `RM2025-Core` submodule is private and not covered by this license.
 - HKUST ENTERPRIZE RoboMaster team for RM2025-Core and the G4 project template
 - Jason GAN (RM2024) for the original HT8115 motor driver
 - STMicroelectronics (HAL, CMSIS) and the FreeRTOS project
+- Our friends and classmates at HKUST ISD
+
+<p align="center">
+  <img src="docs/figures/isd_friends.jpg" width="480" alt="With friends from HKUST ISD">
+</p>
+<p align="center"><sub>With our friends from HKUST ISD · 和 ISD 的朋友们合影</sub></p>
