@@ -394,7 +394,8 @@ needed to close the vision-in-the-loop climb are in Host V2.0's
 `hardware/power-distribution-board/` is a KiCad 9 project. Two battery inputs are OR-ed through
 LM74700 ideal-diode controllers with BSC070N10NS5 MOSFETs, with TVS protection and a fuse. The
 24 V rail is split to eight motor ports (four leg, four chassis), the mini PC, the control board and
-a fan, using XT30 connectors. Custom footprints are in `Library.pretty/`.
+a fan, using XT30 connectors. Custom footprints are in `Library.pretty/`. Jason Chan helped
+develop this board.
 
 ### Interface CAD | 结构件
 
@@ -440,6 +441,7 @@ The `RM2025-Core` submodule is private and not covered by this license.
 
 - HKUST ENTERPRIZE RoboMaster team for RM2025-Core and the G4 project template
 - Jason GAN (RM2024) for the original HT8115 motor driver
+- Jason Chan for helping develop the power distribution board
 - STMicroelectronics (HAL, CMSIS) and the FreeRTOS project
 - Our friends and classmates at HKUST ISD
 
