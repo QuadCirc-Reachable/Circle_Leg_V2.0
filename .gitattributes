@@ -1,0 +1,6 @@
+# GitHub language statistics: count this project's own code only
+Drivers/**      linguist-vendored
+Middlewares/**  linguist-vendored
+Core/**         linguist-generated
+docs/**         linguist-documentation
+hardware/**     linguist-detectable=false

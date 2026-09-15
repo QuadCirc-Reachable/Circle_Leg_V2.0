@@ -71,3 +71,11 @@ venv
 node_modules
 .sass-cache
 
+
+# MSYS make crash dumps
+*.stackdump
+
+# KiCad local state / caches / autosave backups
+*.kicad_prl
+fp-info-cache
+*-backups/
