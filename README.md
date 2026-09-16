@@ -9,13 +9,13 @@
 </p>
 
 <p align="center">
-  <a href="#overview">English</a> | <a href="#项目概述">中文</a>
+  <b>English</b> | <a href="README_zh.md">中文</a>
 </p>
 
 <p align="center">
   <img src="docs/figures/cover.jpg" width="360" alt="Full-size REACHABLE prototype on display at HKUST ISD">
 </p>
-<p align="center"><sub>The full-size prototype on display at HKUST ISD · 全尺寸原型在港科大 ISD 展出</sub></p>
+<p align="center"><sub>The full-size prototype on display at HKUST ISD</sub></p>
 
 Embedded control firmware for the **full-size REACHABLE (QuadCirc) electric wheelchair**. It has four
 **CircLeg** eccentric wheel-leg modules. Each one rolls as an ordinary wheel on flat ground and turns
@@ -52,35 +52,7 @@ Related repositories:
 
 ---
 
-## 项目概述
-
-<details>
-<summary>点击展开中文说明</summary>
-
-本仓库是 **REACHABLE（QuadCirc）全尺寸电动轮椅** 的嵌入式控制固件。整车由四个 **CircLeg 偏心轮腿模块**
-组成：在平地上它就是普通的轮子，遇到 5–18 cm 的路沿、门槛和单级台阶时变成"腿"，把底盘抬过障碍。
-香港科技大学毕业设计项目 **SL05a-25**（2025–2026）。
-
-每个 CircLeg 的轮毂相对轮心有偏心距 *r*，转动轮毂即可升降该角的底盘，而车轮始终不离地。每个角只用
-**两个电机**（轮电机 + 腿电机），固件实现：
-
-- **行驶**：针对梯形底盘的差速（skid-steer）逆运动学、D-pad 四档速度、加速度限幅与平滑。
-- **舒适模式（COMFORT）**：变阻抗主动悬挂（虚拟笛卡尔弹簧阻尼 → 每条腿的 MIT 增益）、IMU 车身调平、
-  在线质量估计，以及保证四轮着地的 **Warp（对角扭转）补偿**。
-- **攀爬模式（CLIMBING）**：逐腿状态机，用电机 **力矩残差** + 轮速骤降检测台阶接触，再按纯几何轨迹
-  爬升；前轮对先爬，后轮对随后。
-- **安全**：上位机断连检测（500 ms）、平滑的模式切换、奇异点限幅，以及可在 SEGGER Ozone 中实时调参的调试结构体。
-
-相关仓库：本仓库（全尺寸固件 + PCB + 结构件）、
-[Circle_Leg_V1.0](https://github.com/QuadCirc-Reachable/Circle_Leg_V1.0)（半尺寸原型固件）、
-[Circle_Leg_Host_V2.0](https://github.com/QuadCirc-Reachable/Circle_Leg_Host_V2.0)（上位机：手柄链路 + 可选 RealSense 台阶视觉）、
-[Circle_Leg_Host_V1.0](https://github.com/QuadCirc-Reachable/Circle_Leg_Host_V1.0)（旧版单文件手柄 → 串口桥接）。
-
-</details>
-
----
-
-## Demo | 演示
+## Demo
 
 <p align="center">
   <a href="https://youtu.be/onJCvx1d8Sw">
@@ -89,12 +61,12 @@ Related repositories:
 </p>
 
 <p align="center">
-  ▶ <a href="https://youtu.be/onJCvx1d8Sw">Watch the REACHABLE pitch video on YouTube</a> · <a href="https://youtu.be/onJCvx1d8Sw">在 YouTube 观看项目视频</a>
+  ▶ <a href="https://youtu.be/onJCvx1d8Sw">Watch the REACHABLE pitch video on YouTube</a>
 </p>
 
 ---
 
-## Key Results | 主要结果
+## Key Results
 
 Full-size prototype, as reported in the team's final project report (June 2026):
 
@@ -110,7 +82,7 @@ Full-size prototype, as reported in the team's final project report (June 2026):
 
 ---
 
-## System Architecture | 系统架构
+## System Architecture
 
 ```
 ┌──────────────────────────┐  UART 2 Mbit/s (CH343)   ┌──────────────────────────────────────────────┐
@@ -145,9 +117,9 @@ active mode's controllers, turns per-leg **height** targets into leg angles and 
 
 ---
 
-## Control Design | 控制设计
+## Control Design
 
-### Eccentric wheel-leg kinematics | 偏心轮腿运动学
+### Eccentric wheel-leg kinematics
 
 <p align="center">
   <img src="docs/figures/circleg_geometry.png" width="360" alt="CircLeg geometry">
@@ -161,7 +133,7 @@ $$H(\theta) = R - r\cos\theta, \qquad \theta = \arccos\frac{R - H}{r}, \qquad \f
 The Jacobian vanishes at 0° and 180°, so every controller clamps the working range away from these
 singularities.
 
-### Chassis modes | 底盘模式
+### Chassis modes
 
 | Mode | Wheels | Legs | Notes |
 |------|--------|------|-------|
@@ -174,7 +146,7 @@ singularities.
 CALIBRATION, FREE_CONTROL and DEBUG states are compiled in but not in the live cycle. The DM leg
 motors store their zero at the lowest pose in flash, so no calibration is needed at power-up.
 
-### COMFORT — variable-impedance suspension | 变阻抗主动悬挂
+### COMFORT — variable-impedance suspension
 
 A virtual Cartesian spring-damper $(k_v, c_v)$ at each wheel contact point is mapped into joint
 space through the eccentric Jacobian:
@@ -187,7 +159,7 @@ $$K_{p,i} = \left(\frac{\partial H}{\partial \theta_i}\right)^2 k_{v,i}, \qquad 
   load-adaptive gain scale keep the same tuning stable with or without a rider.
 - **Warp**: see below. Overloaded diagonals get softer $k_v$ and underloaded ones are pushed down.
 
-### Warp compensation | Warp（对角扭转）补偿
+### Warp compensation
 
 <p align="center">
   <img src="docs/figures/four_dof_modes.png" width="380" alt="Heave, pitch, roll and warp modes">
@@ -202,7 +174,7 @@ $$e_\text{warp} = \tfrac12\left(I_{FL} + I_{BR}\right) - \tfrac12\left(I_{FR} + 
 It closes a dedicated loop on it: Kp / feed-forward modulation in COMFORT, and a PI loop on the
 per-leg height offset in CLIMBING.
 
-### CLIMBING — step-climbing pipeline | 攀爬流程
+### CLIMBING — step-climbing pipeline
 
 ```
 HOMING_IN ──► WAIT_START ──(X)──► PREP ──► DETECT ──► CLIMBING ──► COMPLETE ──► HOMING_OUT
@@ -225,7 +197,7 @@ HOMING_IN ──► WAIT_START ──(X)──► PREP ──► DETECT ──�
 The full design log, including every tuning decision behind the `dbg_ctrl` parameters, is in
 [docs/UNIFIED_CONTROL_REFACTOR.md](docs/UNIFIED_CONTROL_REFACTOR.md).
 
-### Locomotion | 行驶
+### Locomotion
 
 The trapezoidal chassis uses per-axle skid-steer gains so it tracks straight lines without drifting:
 
@@ -236,11 +208,11 @@ so the chair doesn't lurch when the ride height changes.
 
 ---
 
-## Repository Structure | 目录结构
+## Repository Structure
 
 ```
 Circle_Leg_V2/
-├── Applications/                   # Application layer (this project) | 应用层
+├── Applications/                   # Application layer (this project)
 │   ├── Chassis.hpp/.cpp            # Mode state machine, leveling, IK, climbing orchestration
 │   ├── Chassis_Task.hpp/.cpp       # FreeRTOS 500 Hz control task
 │   ├── Wheel_Leg.hpp/.cpp          # One CircLeg corner: height↔angle, MIT leg pipeline, wheel loop
@@ -254,7 +226,7 @@ Circle_Leg_V2/
 │   ├── Comm_Msg.hpp                # PC_Msg / Reachable_Msg layouts, button bitmasks
 │   ├── Cust_Types.hpp, Helper.hpp  # Shared types and helpers
 │   └── DM_Motor_Test.*             # Stand-alone DM J10010L bring-up test (USE_DM_MOTOR_TEST)
-├── Core/                           # CubeMX HAL init + UserTask.cpp (task creation) | 外设初始化
+├── Core/                           # CubeMX HAL init + UserTask.cpp (task creation)
 ├── Drivers/, Middlewares/          # STM32G4 HAL, CMSIS, CMSIS-DSP (vendor)
 ├── RM2025-Core/                    # Submodule → private RM2025-Core (motors, CAN, IMU, RTOS)
 ├── hardware/
@@ -273,9 +245,9 @@ Circle_Leg_V2/
 
 ---
 
-## Getting Started | 快速开始
+## Getting Started
 
-### Prerequisites | 环境要求
+### Prerequisites
 
 - `arm-none-eabi-gcc` (tested with GCC 12.2 from MSYS2) and GNU Make
 - A SWD probe: SEGGER J-Link (Ozone / J-Flash) or ST-Link (STM32CubeProgrammer)
@@ -285,7 +257,7 @@ Circle_Leg_V2/
 > **RM2025-Core** is an internal library of the HKUST ENTERPRIZE RoboMaster team. It is linked as a
 > git submodule pointing to a private repository and is **not** part of this repository's contents.
 
-### Clone & build | 克隆与编译
+### Clone & build
 
 ```bash
 git clone --recurse-submodules https://github.com/QuadCirc-Reachable/Circle_Leg_V2.0.git
@@ -299,7 +271,7 @@ make -j8
 Every commit pins the exact RM2025-Core snapshot it was built with, so checking out any old commit
 and running `git submodule update` rebuilds it byte-for-byte.
 
-### Flash & debug | 烧录与调试
+### Flash & debug
 
 Flash `build/RM2024-Template-G473.elf` (or `.hex`) over SWD with Ozone, J-Flash or
 STM32CubeProgrammer. For live tuning, open the ELF in SEGGER Ozone and watch or edit these globals:
@@ -310,7 +282,7 @@ STM32CubeProgrammer. For live tuning, open the ELF in SEGGER Ozone and watch or 
 | `DbgSummary` / `dbg_climb_plot` | Most useful signals for plotting at 500 Hz |
 | `dbg_wheel_test_enable` / `dbg_wheel_test_rpm` | Wheel test bypass (`CHASSIS_DEBUG_SNAPSHOT`) |
 
-### Configuration | 配置
+### Configuration
 
 | File | What to change |
 |------|----------------|
@@ -320,7 +292,7 @@ STM32CubeProgrammer. For live tuning, open the ELF in SEGGER Ozone and watch or 
 
 ---
 
-## Operator Controls | 操作说明
+## Operator Controls
 
 Xbox gamepad on the host (see [Circle_Leg_Host_V2.0](https://github.com/QuadCirc-Reachable/Circle_Leg_Host_V2.0)):
 
@@ -335,7 +307,7 @@ Xbox gamepad on the host (see [Circle_Leg_Host_V2.0](https://github.com/QuadCirc
 
 ---
 
-## Communication Protocol | 通信协议
+## Communication Protocol
 
 USART2 at **2 Mbit/s**, RosComm framing with CRC16:
 
@@ -365,13 +337,13 @@ needed to close the vision-in-the-loop climb are in Host V2.0's
 
 ---
 
-## Hardware | 硬件
+## Hardware
 
 <div align="center">
 <table>
   <tr>
-    <td align="center"><img src="docs/figures/dev_side_view.jpg" height="340" alt="Side view of the full-size prototype during development"><br><sub>Side view during development · 开发阶段侧视图</sub></td>
-    <td align="center"><img src="docs/figures/fullsize_prototype.jpg" height="340" alt="CircLeg modules, front view"><br><sub>CircLeg modules, front view · 轮腿模块正视图</sub></td>
+    <td align="center"><img src="docs/figures/dev_side_view.jpg" height="340" alt="Side view of the full-size prototype during development"><br><sub>Side view during development</sub></td>
+    <td align="center"><img src="docs/figures/fullsize_prototype.jpg" height="340" alt="CircLeg modules, front view"><br><sub>CircLeg modules, front view</sub></td>
   </tr>
 </table>
 </div>
@@ -389,7 +361,7 @@ needed to close the vision-in-the-loop climb are in Host V2.0's
 | Power | 2× DJI TB48 (22.8 V); 24→19 V and 24→5 V converters |
 | Host | Jetson Orin Nano + Intel RealSense D435 (curb perception) |
 
-### Power distribution board | 电源分配板
+### Power distribution board
 
 `hardware/power-distribution-board/` is a KiCad 9 project. Two battery inputs are OR-ed through
 LM74700 ideal-diode controllers with BSC070N10NS5 MOSFETs, with TVS protection and a fuse. The
@@ -397,13 +369,13 @@ LM74700 ideal-diode controllers with BSC070N10NS5 MOSFETs, with TVS protection a
 a fan, using XT30 connectors. Custom footprints are in `Library.pretty/`. Jason Chan helped
 develop this board.
 
-### Interface CAD | 结构件
+### Interface CAD
 
 `hardware/interface-cad/` holds the SolidWorks assembly `Assem3.SLDASM` and its parts.
 
 ---
 
-## Documentation | 文档
+## Documentation
 
 | Document | Content |
 |----------|---------|
@@ -413,7 +385,7 @@ develop this board.
 
 ---
 
-## Team | 团队
+## Team
 
 <p align="center">
   <img src="docs/figures/team.jpg" width="560" alt="The REACHABLE team at the HKUST ISD Class of 2026 event">
@@ -437,7 +409,7 @@ Third-party components keep their own licenses: STM32 HAL / CMSIS in `Drivers/` 
 and template files (`Core.mk`, `Core/Src/UserTask.cpp`) from the ENTERPRIZE RoboMaster team.
 The `RM2025-Core` submodule is private and not covered by this license.
 
-## Acknowledgments | 致谢
+## Acknowledgments
 
 - HKUST ENTERPRIZE RoboMaster team for RM2025-Core and the G4 project template
 - Jason GAN (RM2024) for the original HT8115 motor driver
@@ -448,4 +420,4 @@ The `RM2025-Core` submodule is private and not covered by this license.
 <p align="center">
   <img src="docs/figures/isd_friends.jpg" width="480" alt="With friends from HKUST ISD">
 </p>
-<p align="center"><sub>With our friends from HKUST ISD · 和 ISD 的朋友们合影</sub></p>
+<p align="center"><sub>With our friends from HKUST ISD</sub></p>
